@@ -8,10 +8,28 @@ set(CMAKE_CXX_FLAGS_DEBUG "-march=native ${CMAKE_CXX_FLAGS_DEBUG}")
 set(CMAKE_CXX_FLAGS_RELEASE "-march=native  ${CMAKE_CXX_FLAGS_RELEASE}")
 
 set(gpu_device torch::kCUDA)
-set(data_father_path "\"/home/redamancyguy/Desktop/buffer/data/\"")
 
-set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
-set(Torch_DIR /home/redamancyguy/Desktop/libtorch/share/cmake/Torch)
+# Local writable data root. Parameter.h.in expects the value to already be quoted.
+if(NOT data_father_path)
+    set(data_father_path "\"${PROJECT_SOURCE_DIR}/buffer/data/\"")
+endif()
+
+# Locate libtorch: honour an explicit -DTorch_DIR / $ENV{Torch_DIR}, otherwise use
+# the torch that ships with the python installation.
+if(NOT Torch_DIR)
+    file(GLOB _torch_candidates
+            "$ENV{Torch_DIR}"
+            "/usr/local/lib/python3*/dist-packages/torch/share/cmake/Torch"
+            "${PROJECT_SOURCE_DIR}/libtorch/share/cmake/Torch")
+    foreach(_cand ${_torch_candidates})
+        if(EXISTS "${_cand}/TorchConfig.cmake")
+            set(Torch_DIR "${_cand}")
+            break()
+        endif()
+    endforeach()
+endif()
+message(STATUS "Torch_DIR = ${Torch_DIR}")
+message(STATUS "data_father_path = ${data_father_path}")
 
 #set(CUDA_LAUNCH_BLOCKING 1)
 #set(TORCH_USE_CUDA_DSA 1)
@@ -27,11 +45,9 @@ configure_file(
 
 #execute_process(COMMAND "conda deactivate")
 #find_package(PythonInterp REQUIRED)
-#find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
 find_package(Torch REQUIRED)
-find_package(Boost REQUIRED COMPONENTS fiber date_time system filesystem)
-set(gpu_device torch::kCUDA)
-set(data_father_path "\"/home/redamancyguy/Desktop/buffer/data/\"")
+find_package(Boost REQUIRED)
 
 #link_libraries("${TORCH_LIBRARIES}" Python3::Python Python3::NumPy)
 link_libraries("${TORCH_LIBRARIES}")
@@ -46,6 +62,8 @@ add_executable(main main.cpp
 #        index/include/RL_network.hpp index/workspace/gen_exp.hpp
 #        index/workspace/global_on_policy.cpp index/workspace/train.cpp
         )
+# main.cpp pulls in matplotlibcpp.h (a python binding), so it needs the interpreter.
+target_link_libraries(main PRIVATE Python3::Python Python3::NumPy)
 
 add_executable(train index/workspace/train.cpp)
 
@@ -57,12 +75,14 @@ add_executable(dynamic_data benchmark/dynamic_data.cpp)
 
 add_executable(dynamic_data2 benchmark/dynamic_data2.cpp)
 
-add_executable(add_get_erase benchmark/add_get_erase.cpp
-        benchmark/Ablation.cpp)
+# add_get_erase.cpp and Ablation.cpp both define main(); they must be separate targets.
+add_executable(add_get_erase benchmark/add_get_erase.cpp)
 
 add_executable(read_only benchmark/read_only.cpp)
 
-add_executable(test benchmark/test.cpp )
+# benchmark/test.cpp includes ../others/other_indexes.h. The b+tree/alex/pgm/lipp
+# baselines are not part of this repository, so this target cannot be built.
+# add_executable(test benchmark/test.cpp )
 
 add_executable(opration_latency benchmark/opration_latency.cpp)
 
