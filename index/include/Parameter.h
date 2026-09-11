@@ -12,7 +12,7 @@
 typedef double KEY_TYPE;
 //typedef long long KEY_TYPE;
 typedef double VALUE_TYPE;
-static const std::string father_path = "/root/Chameleon/buffer/data/";
+static const std::string father_path = "/root/Chameleon/data/";
 static const std::string data_father_path = father_path + "data_set/";
 static const std::string train_dataset_path = father_path + "train_dataset/";
 static const std::string model_father_path = father_path + "model/";

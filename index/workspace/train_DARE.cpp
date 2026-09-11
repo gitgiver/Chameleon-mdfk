@@ -155,7 +155,8 @@ int main(int argc, char const *argv[]) {
 
     int pid = 0;
 //    sample(pid);
-    GPU_DEVICE = torch::Device(torch::DeviceType::CUDA,1);
+    // single-GPU host: keep every forked sampler on device 0 (was CUDA:1)
+    GPU_DEVICE = torch::Device(torch::DeviceType::CUDA,0);
     for ( auto i = 0; i < process_count; i++) {
         random_seed();
         if (fork() == 0) {

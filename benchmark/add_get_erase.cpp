@@ -112,10 +112,7 @@ int main() {
     result << "train_proportion:" << train_proportion << "============================" << std::endl;
     std::vector<EvaluationTask> tasks;
     tasks.push_back({"uden.data",0,int(100e6)});
-    tasks.push_back({"logn.data",0,int(100e6)});
-    tasks.push_back({"osmc.data",0,int(100e6)});
     tasks.push_back({"face.data",0,int(100e6)});
-    tasks.push_back({"local_skew.data",0,int(100e6)});
     for (auto tsk:tasks) {
         result << tsk.dataset_name <<"  start:"<< tsk.start <<"  length:"<< tsk.length << std::endl;
         dataset = dataset_source::get_dataset<std::pair<KEY_TYPE, VALUE_TYPE>>(data_father_path+tsk.dataset_name);

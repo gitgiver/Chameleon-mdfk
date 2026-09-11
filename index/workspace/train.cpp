@@ -66,7 +66,8 @@
 }
 int main(int argc, char const *argv[]) {
     std::vector<int> a;
-    GPU_DEVICE = torch::Device(torch::DeviceType::CUDA,1);
+    // single-GPU host: use device 0 (was CUDA:1)
+    GPU_DEVICE = torch::Device(torch::DeviceType::CUDA,0);
     train();
     return 0;
 //    if(fork() == 0)

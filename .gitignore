@@ -5,5 +5,5 @@ cmake-build-*/
 *.o
 
 # Local datasets, trained models, RL experience and logs (see index/include/Parameter.h)
-buffer/
+data/
 logfile.txt

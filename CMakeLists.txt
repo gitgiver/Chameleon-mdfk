@@ -11,7 +11,7 @@ set(gpu_device torch::kCUDA)
 
 # Local writable data root. Parameter.h.in expects the value to already be quoted.
 if(NOT data_father_path)
-    set(data_father_path "\"${PROJECT_SOURCE_DIR}/buffer/data/\"")
+    set(data_father_path "\"${PROJECT_SOURCE_DIR}/data/\"")
 endif()
 
 # Locate libtorch: honour an explicit -DTorch_DIR / $ENV{Torch_DIR}, otherwise use
