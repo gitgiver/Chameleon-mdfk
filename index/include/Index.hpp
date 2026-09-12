@@ -7,6 +7,9 @@
 
 #include <thread>
 #include <stack>
+#include <cstdlib>
+#include <algorithm>
+#include <cmath>
 #include "Configuration.hpp"
 #include "RL_network.hpp"
 
@@ -26,6 +29,15 @@ const float max_density = 0.95;
 double hash_factor = 10231023.353;
 //double hash_factor=1;
 //double  hash_factor = 131.3;
+// >>> ADAPTIVE LEAF PILOT <<<
+// theta <= 0 : disabled  -> every leaf is the original hash leaf (baseline behaviour)
+// theta >  0 : a leaf region whose local skew <= theta becomes an ordered, densely
+//              packed (density 1.0) key-sorted leaf; otherwise the hash leaf is kept.
+// Set through the ADAPTIVE_THETA environment variable so a single binary can sweep it.
+static double adaptive_theta = []() -> double {
+    const char *s = std::getenv("ADAPTIVE_THETA");
+    return s ? std::atof(s) : -1.0;
+}();
 //#define inner_cost_weight (float(6.01213))
 #define inner_cost_weight (float(60.01213))
 #define leaf_cost_weight (float(1.35074178))
@@ -52,11 +64,33 @@ inline void set_bitmap(unsigned int *bitmap, const unsigned int position) {
     bitmap[index] |= 1 << bit_index;
 }
 
+// Same measure as DataSet.hpp local_skew, inlined here to avoid pulling that header in.
+// ~1 for locally uniform regions, >> 1 for locally skewed (spiky) regions.
+template<class key_T, class value_T>
+inline double leaf_skew(
+        typename std::vector<std::pair<key_T, value_T>>::const_iterator begin,
+        typename std::vector<std::pair<key_T, value_T>>::const_iterator end,
+        double lower, double upper) {
+    double n_1 = double(end - begin) - 1;
+    if (n_1 <= 0) { return 1.0; }
+    double sum = 0;
+    for (auto s = begin + 1; s < end; ++s) {
+        double gl = ((s - 1)->first - lower) / (upper - lower);
+        double gr = (s->first - lower) / (upper - lower);
+        double gap = gr - gl;
+        if (gap <= 1e-18) { gap = 1e-18; }
+        sum += 1.0 / gap;
+    }
+    return sum / (n_1 * n_1);
+}
+
 namespace Hits {
     unsigned long long node_memory_count = 0;
     long long inner_cost = 0;
     long long leaf_cost = 0;
     long long leaf_max_cost = 0;
+    unsigned long long leaf_count = 0;
+    unsigned long long ordered_leaf_count = 0;
 
     template<class key_T, class value_T>
     class DataNode {
@@ -75,6 +109,7 @@ namespace Hits {
         ///////
         int size{};
         int max_offset{};
+        int ordered{};//1 -> dense key-sorted leaf (pilot); 0 -> original hash leaf
         slot_type array[0];
 
 
@@ -93,6 +128,7 @@ namespace Hits {
             node->upper = upper;
             node->size = 0;
             node->max_offset = 0;
+            node->ordered = 0;
             unsigned int *bit_map = node->bitmap_start();
             for (int i = 0; i < t; ++i) {
                 bit_map[i] = 0;
@@ -118,6 +154,7 @@ namespace Hits {
         }
 
         int find(double key) {
+            if (ordered) { return find_ordered(key); }
             auto position = hash(key);
             auto left = position;
             auto right = position;
@@ -139,6 +176,12 @@ namespace Hits {
         }
 
         int find_with_cost(double key) {
+            if (ordered) {
+                ++leaf_cost;
+                leaf_max_cost = std::max<long long>(leaf_max_cost,
+                                                    (long long) std::log2(double(std::max(1, size))));
+                return find_ordered(key);
+            }
             auto position = hash(key);
             auto left = position;
             auto right = position;
@@ -157,6 +200,18 @@ namespace Hits {
                 }
                 ++leaf_cost;
                 leaf_max_cost = std::max<long long>(leaf_max_cost,i);
+            }
+            return -1;
+        }
+
+        int find_ordered(double key) {
+            int lo = 0;
+            int hi = size - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) >> 1;
+                double k = array[mid].first;
+                if (k == key) { return mid; }
+                if (k < key) { lo = mid + 1; } else { hi = mid - 1; }
             }
             return -1;
         }
@@ -208,6 +263,48 @@ namespace Hits {
             return -1;
         }
     };
+
+
+    // Pilot: build a leaf either as the original hash leaf or, when the region is not
+    // locally skewed (leaf_skew <= adaptive_theta), as a densely packed key-sorted leaf.
+    template<class key_T, class value_T>
+    DataNode<key_T, value_T> *build_leaf_(
+            typename std::vector<std::pair<key_T, value_T>>::const_iterator begin,
+            typename std::vector<std::pair<key_T, value_T>>::const_iterator end,
+            double lower, double upper) {
+        using data_node_type = DataNode<key_T, value_T>;
+        auto data_count = int(end - begin);
+        double skew = leaf_skew<key_T, value_T>(begin, end, lower, upper);
+        bool use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
+        ++leaf_count;
+        if (use_ordered) {
+            ++ordered_leaf_count;
+            auto node = data_node_type::new_segment(std::max(data_count, DATA_NODE_SIZE), lower, upper);
+            std::vector<std::pair<key_T, value_T>> tmp(begin, end);
+            std::sort(tmp.begin(), tmp.end(),
+                      [](const std::pair<key_T, value_T> &a, const std::pair<key_T, value_T> &b) {
+                          return a.first < b.first;
+                      });
+            for (int i = 0; i < data_count; ++i) {
+                node->array[i] = tmp[i];
+                set_bitmap(node->bitmap_start(), i);
+            }
+            node->size = data_count;
+            node->ordered = 1;
+            return node;
+        }
+        auto node = data_node_type::new_segment(
+                std::max(int(float(data_count) / default_density), DATA_NODE_SIZE), lower, upper);
+        for (auto ii = begin; ii < end; ++ii) {
+            auto position = node->find_insert(ii->first);
+            if (position < 0) { throw MyException("bulk load insertion bad position!"); }
+            node->array[position].first = ii->first;
+            node->array[position].second = ii->second;
+            set_bitmap(node->bitmap_start(), position);
+            ++node->size;
+        }
+        return node;
+    }
 
 
     template<class key_T, class value_T>
@@ -414,19 +511,8 @@ namespace Hits {
                     }
                 }
             } else {
-                //calculate scan cost of hash table
-                //establish a leaf node
-                auto data_node = Hits::DataNode<key_T, value_T>::new_segment(
-                        int(double(std::max(DATA_NODE_SIZE, data_count)) / default_density), interval.first,interval.second);
-                pointer_result.second = data_node;
-                for (auto ii = begin; ii < end; ++ii) {
-                    auto position = data_node->find_insert(ii->first);
-                    if (position < 0) { std::cout <<"data_count:"<<data_count<<"  size:"<<data_node->size<<"  capacity:"<<data_node->capacity<< std::endl; throw MyException("bad position!"); }
-                    data_node->array[position].first = ii->first;
-                    data_node->array[position].second = ii->second;
-                    set_bitmap(data_node->bitmap_start(), position);
-                    ++data_node->size;
-                }
+                // leaf: ordered-dense when the region is not locally skewed, hash otherwise
+                pointer_result.second = build_leaf_<key_T, value_T>(begin, end, interval.first, interval.second);
             }
             return pointer_result;
 #endif
@@ -463,20 +549,10 @@ namespace Hits {
                     }
 #endif
 #ifndef using_small_network
-                    auto data_node = DataNode<key_T,value_T>::new_segment(
-                            std::max(int(float(inner_result[inner_slot_id].first.second - inner_result[inner_slot_id].first.first)/default_density),DATA_NODE_SIZE),
+                    auto data_node = build_leaf_<key_T, value_T>(
+                            begin + root_result[root_slot_id].first.first + inner_result[inner_slot_id].first.first,
+                            begin + root_result[root_slot_id].first.first + inner_result[inner_slot_id].first.second,
                             inner_result[inner_slot_id].second.first, inner_result[inner_slot_id].second.second);
-                    for(auto i = begin + root_result[root_slot_id].first.first + inner_result[inner_slot_id].first.first,
-                            end_tmp = begin + root_result[root_slot_id].first.first + inner_result[inner_slot_id].first.second
-                            ;i<end_tmp;++i){
-                        auto position = data_node->find_insert(i->first);
-                        if(position < 0){
-                            throw MyException("bulk load insertion bad position!");
-                        }
-                        data_node->array[position] = *i;
-                        set_bitmap(data_node->bitmap_start(),position);
-                        ++data_node->size;
-                    }
                     de_set_bitmap(inner_node->bitmap_start(), inner_slot_id);
                     inner_node->array[inner_slot_id].data_node = data_node;
 #endif
