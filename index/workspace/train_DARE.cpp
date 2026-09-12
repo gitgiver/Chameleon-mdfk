@@ -142,7 +142,8 @@ public:
 }
 int main(int argc, char const *argv[]) {
 
-    double random_rate_discount_rate = 0.9997;
+    // fast validation: 0.9997 needs ~96.8k experiences, 0.9 needs ~280
+    double random_rate_discount_rate = 0.9;
 //    double random_rate_discount_rate = 0.993;
     auto *rs = create_shared_memory<RunningStatus>();
     rs->random_rate = 1;

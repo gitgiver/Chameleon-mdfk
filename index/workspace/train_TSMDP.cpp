@@ -387,7 +387,8 @@ int main(){
                 q_target_network->to(GPU_DEVICE);
                 q_network->to(GPU_DEVICE);
             }
-            random_rate *= 0.9995;
+            // fast validation: 0.9995 needs ~11.6k trees, 0.9 needs ~59
+            random_rate *= 0.9;
 //            random_rate *= 0.995;
         }
         if(random_rate < 3e-3){
