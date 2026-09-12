@@ -29,6 +29,8 @@ GlobalController controller;
 
 int main() {
     controller.load_in();
+    // make the GA-driven Configuration reproducible so theta is the only variable
+    e.seed(12345);
 
     const char *ds_env = std::getenv("PILOT_DATASET");
     std::string dataset_name = ds_env ? ds_env : "uden.data";
@@ -59,6 +61,7 @@ int main() {
     Hits::inner_cost = 0;
     Hits::leaf_cost = 0;
     Hits::leaf_max_cost = 0;
+    Hits::leaf_skews.clear();
 
     auto index = new Hits::Index<KEY_TYPE, VALUE_TYPE>(conf, min_max.first, min_max.second);
     index->bulk_load(dataset.begin(), dataset.end());
@@ -82,12 +85,37 @@ int main() {
     auto t1 = std::chrono::high_resolution_clock::now();
     double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / double(n_queries);
 
-    printf("theta=%-10g dataset=%-12s n=%-10ld mem_MB=%-9.2f mem_ratio=%-7.4f get_ns=%-8.2f "
+    printf("theta=%-10g dataset=%-12s n=%-10ld root=%-8.0f mem_MB=%-9.2f mem_ratio=%-7.4f get_ns=%-8.2f "
            "leaves=%-6llu ordered=%-6llu(%.1f%%) inner=%-10lld leaf=%-10lld errors=%ld\n",
-           adaptive_theta, dataset_name.c_str(), n, mem_bytes / (1024.0 * 1024.0), mem_ratio, ns,
+           adaptive_theta, dataset_name.c_str(), n, conf.root_fan_out,
+           mem_bytes / (1024.0 * 1024.0), mem_ratio, ns,
            Hits::leaf_count, Hits::ordered_leaf_count,
            100.0 * double(Hits::ordered_leaf_count) / double(std::max<unsigned long long>(1, Hits::leaf_count)),
            Hits::inner_cost, Hits::leaf_cost, errors);
+    fflush(stdout);
+
+    // per-leaf skew distribution
+    if (!Hits::leaf_skews.empty()) {
+        auto s = Hits::leaf_skews;
+        std::sort(s.begin(), s.end());
+        double mn = s.front(), mx = s.back();
+        auto pct = [&](double p) { return s[std::min(s.size() - 1, (size_t) (p * s.size()))]; };
+        printf("  skew: min=%.4f p25=%.4f p50=%.4f p75=%.4f max=%.4f  (leaves=%zu)\n",
+               mn, pct(0.25), pct(0.50), pct(0.75), mx, s.size());
+        const int B = 20;
+        std::vector<long long> hist(B, 0);
+        double w = (mx - mn) / B;
+        if (w <= 0) { w = 1; }
+        for (double v: s) {
+            int b = std::min(B - 1, std::max(0, (int) ((v - mn) / w)));
+            ++hist[b];
+        }
+        long long hmax = *std::max_element(hist.begin(), hist.end());
+        for (int b = 0; b < B; ++b) {
+            int bar = (int) (60.0 * double(hist[b]) / double(std::max(1LL, hmax)));
+            printf("   [%8.4f] %9lld %s\n", mn + b * w, hist[b], std::string(std::max(0, bar), '#').c_str());
+        }
+    }
     fflush(stdout);
 
     delete index;

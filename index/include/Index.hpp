@@ -91,6 +91,7 @@ namespace Hits {
     long long leaf_max_cost = 0;
     unsigned long long leaf_count = 0;
     unsigned long long ordered_leaf_count = 0;
+    std::vector<double> leaf_skews;//per-leaf local skew, for diagnosing the threshold
 
     template<class key_T, class value_T>
     class DataNode {
@@ -277,6 +278,7 @@ namespace Hits {
         double skew = leaf_skew<key_T, value_T>(begin, end, lower, upper);
         bool use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
         ++leaf_count;
+        leaf_skews.push_back(skew);
         if (use_ordered) {
             ++ordered_leaf_count;
             auto node = data_node_type::new_segment(std::max(data_count, DATA_NODE_SIZE), lower, upper);
