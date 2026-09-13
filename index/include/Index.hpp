@@ -92,6 +92,8 @@ namespace Hits {
     unsigned long long leaf_count = 0;
     unsigned long long ordered_leaf_count = 0;
     std::vector<double> leaf_skews;//per-leaf local skew, for diagnosing the threshold
+    long long ordered_probe_sum = 0;//sum of searched window sizes over ordered-leaf lookups
+    long long ordered_lookup_count = 0;
 
     template<class key_T, class value_T>
     class DataNode {
@@ -205,9 +207,43 @@ namespace Hits {
             return -1;
         }
 
+        // Uses the leaf's own min/max keys as a linear model of the rank, then
+        // gallops outward from the predicted slot and binary searches the bracket.
+        // Accurate prediction (locally uniform keys) -> tiny bracket -> O(1);
+        // bad prediction degrades to O(log size).
         int find_ordered(double key) {
-            int lo = 0;
-            int hi = size - 1;
+            if (size <= 0) { return -1; }
+            const double kmin = array[0].first;
+            const double kmax = array[size - 1].first;
+            if (key < kmin || key > kmax) { return -1; }
+            int p = (kmax > kmin) ? int(double(size - 1) * (key - kmin) / (kmax - kmin)) : 0;
+            if (p < 0) { p = 0; }
+            if (p > size - 1) { p = size - 1; }
+            if (array[p].first == key) { return p; }
+
+            int lo;
+            int hi;
+            if (array[p].first < key) {//key lies to the right of the prediction
+                int last = p;
+                int d = 1;
+                while (p + d < size && array[p + d].first < key) {
+                    last = p + d;
+                    d <<= 1;
+                }
+                lo = last + 1;
+                hi = std::min(size - 1, p + d);
+            } else {//key lies to the left of the prediction
+                int last = p;
+                int d = 1;
+                while (p - d >= 0 && array[p - d].first > key) {
+                    last = p - d;
+                    d <<= 1;
+                }
+                lo = std::max(0, p - d);
+                hi = last - 1;
+            }
+            ordered_probe_sum += (hi - lo + 1);
+            ++ordered_lookup_count;
             while (lo <= hi) {
                 int mid = (lo + hi) >> 1;
                 double k = array[mid].first;

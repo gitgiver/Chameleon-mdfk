@@ -62,6 +62,8 @@ int main() {
     Hits::leaf_cost = 0;
     Hits::leaf_max_cost = 0;
     Hits::leaf_skews.clear();
+    Hits::ordered_probe_sum = 0;
+    Hits::ordered_lookup_count = 0;
 
     auto index = new Hits::Index<KEY_TYPE, VALUE_TYPE>(conf, min_max.first, min_max.second);
     index->bulk_load(dataset.begin(), dataset.end());
@@ -92,6 +94,11 @@ int main() {
            Hits::leaf_count, Hits::ordered_leaf_count,
            100.0 * double(Hits::ordered_leaf_count) / double(std::max<unsigned long long>(1, Hits::leaf_count)),
            Hits::inner_cost, Hits::leaf_cost, errors);
+    if (Hits::ordered_lookup_count > 0) {
+        printf("  ordered-leaf prediction: avg searched window = %.2f slots (over %lld lookups)\n",
+               double(Hits::ordered_probe_sum) / double(Hits::ordered_lookup_count),
+               Hits::ordered_lookup_count);
+    }
     fflush(stdout);
 
     // per-leaf skew distribution
