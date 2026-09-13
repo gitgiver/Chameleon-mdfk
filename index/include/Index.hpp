@@ -95,6 +95,16 @@ namespace Hits {
     long long ordered_probe_sum = 0;//sum of searched window sizes over ordered-leaf lookups
     long long ordered_lookup_count = 0;
 
+    // per-leaf diagnostics: lets us tell whether ordered-leaf cost is driven by
+    // the leaf's size or by its local skew.
+    struct LeafStat {
+        int size;
+        double skew;
+        long long lookups;
+        long long probe;
+    };
+    std::vector<LeafStat> leaf_stats;
+
     template<class key_T, class value_T>
     class DataNode {
     public:
@@ -113,6 +123,7 @@ namespace Hits {
         int size{};
         int max_offset{};
         int ordered{};//1 -> dense key-sorted leaf (pilot); 0 -> original hash leaf
+        int leaf_id{-1};//index into Hits::leaf_stats, for diagnostics
         slot_type array[0];
 
 
@@ -132,6 +143,7 @@ namespace Hits {
             node->size = 0;
             node->max_offset = 0;
             node->ordered = 0;
+            node->leaf_id = -1;
             unsigned int *bit_map = node->bitmap_start();
             for (int i = 0; i < t; ++i) {
                 bit_map[i] = 0;
@@ -212,45 +224,60 @@ namespace Hits {
         // Accurate prediction (locally uniform keys) -> tiny bracket -> O(1);
         // bad prediction degrades to O(log size).
         int find_ordered(double key) {
-            if (size <= 0) { return -1; }
-            const double kmin = array[0].first;
-            const double kmax = array[size - 1].first;
-            if (key < kmin || key > kmax) { return -1; }
-            int p = (kmax > kmin) ? int(double(size - 1) * (key - kmin) / (kmax - kmin)) : 0;
-            if (p < 0) { p = 0; }
-            if (p > size - 1) { p = size - 1; }
-            if (array[p].first == key) { return p; }
-
-            int lo;
-            int hi;
-            if (array[p].first < key) {//key lies to the right of the prediction
-                int last = p;
-                int d = 1;
-                while (p + d < size && array[p + d].first < key) {
-                    last = p + d;
-                    d <<= 1;
+            long long steps = 0;
+            int result = -1;
+            if (size > 0) {
+                const double kmin = array[0].first;
+                const double kmax = array[size - 1].first;
+                if (key >= kmin && key <= kmax) {
+                    int p = (kmax > kmin) ? int(double(size - 1) * (key - kmin) / (kmax - kmin)) : 0;
+                    if (p < 0) { p = 0; }
+                    if (p > size - 1) { p = size - 1; }
+                    steps = 1;//the prediction access
+                    if (array[p].first == key) {
+                        result = p;
+                    } else {
+                        int lo;
+                        int hi;
+                        if (array[p].first < key) {//key lies to the right of the prediction
+                            int last = p;
+                            int d = 1;
+                            while (p + d < size && array[p + d].first < key) {
+                                last = p + d;
+                                d <<= 1;
+                                ++steps;
+                            }
+                            lo = last + 1;
+                            hi = std::min(size - 1, p + d);
+                        } else {//key lies to the left of the prediction
+                            int last = p;
+                            int d = 1;
+                            while (p - d >= 0 && array[p - d].first > key) {
+                                last = p - d;
+                                d <<= 1;
+                                ++steps;
+                            }
+                            lo = std::max(0, p - d);
+                            hi = last - 1;
+                        }
+                        ordered_probe_sum += (hi - lo + 1);
+                        ++ordered_lookup_count;
+                        while (lo <= hi) {
+                            ++steps;
+                            int mid = (lo + hi) >> 1;
+                            double k = array[mid].first;
+                            if (k == key) { result = mid; break; }
+                            if (k < key) { lo = mid + 1; } else { hi = mid - 1; }
+                        }
+                    }
                 }
-                lo = last + 1;
-                hi = std::min(size - 1, p + d);
-            } else {//key lies to the left of the prediction
-                int last = p;
-                int d = 1;
-                while (p - d >= 0 && array[p - d].first > key) {
-                    last = p - d;
-                    d <<= 1;
-                }
-                lo = std::max(0, p - d);
-                hi = last - 1;
             }
-            ordered_probe_sum += (hi - lo + 1);
-            ++ordered_lookup_count;
-            while (lo <= hi) {
-                int mid = (lo + hi) >> 1;
-                double k = array[mid].first;
-                if (k == key) { return mid; }
-                if (k < key) { lo = mid + 1; } else { hi = mid - 1; }
+            if (leaf_id >= 0) {
+                LeafStat &st = leaf_stats[leaf_id];
+                ++st.lookups;
+                st.probe += steps;
             }
-            return -1;
+            return result;
         }
 
         int find_insert(double key) {
@@ -329,6 +356,8 @@ namespace Hits {
             }
             node->size = data_count;
             node->ordered = 1;
+            node->leaf_id = int(leaf_stats.size());
+            leaf_stats.push_back({data_count, skew, 0, 0});
             return node;
         }
         auto node = data_node_type::new_segment(
@@ -341,6 +370,8 @@ namespace Hits {
             set_bitmap(node->bitmap_start(), position);
             ++node->size;
         }
+        node->leaf_id = int(leaf_stats.size());
+        leaf_stats.push_back({data_count, skew, 0, 0});
         return node;
     }
 

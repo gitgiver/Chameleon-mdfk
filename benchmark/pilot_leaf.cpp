@@ -15,6 +15,8 @@
 #include <functional>
 #include <iomanip>
 #include <chrono>
+#include <cstdio>
+#include <string>
 #include <torch/torch.h>
 #include "../include/DEFINE.h"
 
@@ -64,6 +66,7 @@ int main() {
     Hits::leaf_skews.clear();
     Hits::ordered_probe_sum = 0;
     Hits::ordered_lookup_count = 0;
+    Hits::leaf_stats.clear();
 
     auto index = new Hits::Index<KEY_TYPE, VALUE_TYPE>(conf, min_max.first, min_max.second);
     index->bulk_load(dataset.begin(), dataset.end());
@@ -121,6 +124,26 @@ int main() {
         for (int b = 0; b < B; ++b) {
             int bar = (int) (60.0 * double(hist[b]) / double(std::max(1LL, hmax)));
             printf("   [%8.4f] %9lld %s\n", mn + b * w, hist[b], std::string(std::max(0, bar), '#').c_str());
+        }
+    }
+    fflush(stdout);
+
+    // per-leaf diagnostics: size, skew, lookups, avg search steps -> lets us tell
+    // whether the ordered-leaf cost is driven by leaf size or by local skew.
+    {
+        std::string csv = std::string("leaf_stats_") + dataset_name + ".csv";
+        FILE *f = std::fopen(csv.c_str(), "w");
+        if (f) {
+            std::fprintf(f, "leaf_id,size,skew,lookups,avg_probe\n");
+            for (std::size_t i = 0; i < Hits::leaf_stats.size(); ++i) {
+                Hits::LeafStat &s = Hits::leaf_stats[i];
+                if (s.lookups > 0) {
+                    std::fprintf(f, "%zu,%d,%.6f,%lld,%.4f\n", i, s.size, s.skew, s.lookups,
+                                 double(s.probe) / double(s.lookups));
+                }
+            }
+            std::fclose(f);
+            printf("  wrote %s\n", csv.c_str());
         }
     }
     fflush(stdout);
