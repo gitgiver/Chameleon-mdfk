@@ -141,6 +141,8 @@ namespace Hits {
         long long probe;
         double window_p99;
         double window_max;
+        double interval_width;//upper - lower: the span leaf_skew normalizes by
+        double key_span;//max key - min key actually present, i.e. what a linear model spans
     };
     std::vector<LeafStat> leaf_stats;
 
@@ -239,6 +241,14 @@ namespace Hits {
             auto position = hash(key);
             auto left = position;
             auto right = position;
+            // hash leaves must record too, otherwise per-leaf diagnostics only ever cover the
+            // ordered population and the two leaf forms cannot be compared on the same leaf
+            auto record = [&](int steps) {
+                if (leaf_id >= 0) {
+                    ++leaf_stats[leaf_id].lookups;
+                    leaf_stats[leaf_id].probe += steps;
+                }
+            };
             for (int i = 0; i <= max_offset; ++i,--left,++right) {
                 if (left < 0) {
                     left += capacity;
@@ -247,14 +257,17 @@ namespace Hits {
                     right -= capacity;
                 }
                 if (get_bitmap(bitmap_start(), left) && array[left].first == key) {
+                    record(i + 1);
                     return left;
                 }
                 if (get_bitmap(bitmap_start(), right) && array[right].first == key) {
+                    record(i + 1);
                     return right;
                 }
                 ++leaf_cost;
                 leaf_max_cost = std::max<long long>(leaf_max_cost,i);
             }
+            record(max_offset + 1);
             return -1;
         }
 
@@ -380,6 +393,20 @@ namespace Hits {
         using data_node_type = DataNode<key_T, value_T>;
         auto data_count = int(end - begin);
         double skew = leaf_skew<key_T, value_T>(begin, end, lower, upper);
+        // leaf_skew divides by (upper - lower) while the linear model spans the keys that are
+        // actually present. When the two differ, skew is inflated by their ratio, so record
+        // both to tell a real skew/window decoupling from a normalization artifact.
+        double key_span = 0;
+        if (data_count > 0) {
+            double key_min = begin->first;
+            double key_max = begin->first;
+            for (auto it = begin; it != end; ++it) {
+                key_min = std::min(key_min, double(it->first));
+                key_max = std::max(key_max, double(it->first));
+            }
+            key_span = key_max - key_min;
+        }
+        double interval_width = upper - lower;
         // Both criteria and the ordered layout need the keys in order. The copy is skipped
         // when every criterion is off, so the all-hash baseline path is left untouched.
         std::vector<std::pair<key_T, value_T>> sorted_keys;
@@ -412,7 +439,7 @@ namespace Hits {
             node->size = data_count;
             node->ordered = 1;
             node->leaf_id = int(leaf_stats.size());
-            leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max});
+            leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max, interval_width, key_span});
             return node;
         }
         auto node = data_node_type::new_segment(
@@ -426,7 +453,7 @@ namespace Hits {
             ++node->size;
         }
         node->leaf_id = int(leaf_stats.size());
-        leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max});
+        leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max, interval_width, key_span});
         return node;
     }
 

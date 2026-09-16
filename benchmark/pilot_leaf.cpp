@@ -149,12 +149,12 @@ int main() {
         std::string csv = std::string("leaf_stats_") + dataset_name + ".csv";
         FILE *f = std::fopen(csv.c_str(), "w");
         if (f) {
-            std::fprintf(f, "leaf_id,size,skew,window_p99,window_max,lookups,avg_probe\n");
+            std::fprintf(f, "leaf_id,size,skew,window_p99,window_max,interval_width,key_span,lookups,avg_probe\n");
             for (std::size_t i = 0; i < Hits::leaf_stats.size(); ++i) {
                 Hits::LeafStat &s = Hits::leaf_stats[i];
                 if (s.lookups > 0) {
-                    std::fprintf(f, "%zu,%d,%.6f,%.4f,%.4f,%lld,%.4f\n", i, s.size, s.skew,
-                                 s.window_p99, s.window_max, s.lookups,
+                    std::fprintf(f, "%zu,%d,%.6f,%.4f,%.4f,%.6g,%.6g,%lld,%.4f\n", i, s.size, s.skew,
+                                 s.window_p99, s.window_max, s.interval_width, s.key_span, s.lookups,
                                  double(s.probe) / double(s.lookups));
                 }
             }
