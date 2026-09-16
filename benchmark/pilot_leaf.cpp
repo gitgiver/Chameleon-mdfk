@@ -3,9 +3,11 @@
 // Runs the REAL Chameleon index with BOTH agents in play:
 //   - GlobalController (DARE, AC_Q_Net.pt) picks the Configuration (fanout matrix)
 //   - Small_Q_network (TSMDP, tmp.pt) picks the per-region fanout during build_
-// The leaf layout is the only knob changed, via ADAPTIVE_THETA:
-//   ADAPTIVE_THETA <= 0 -> all hash leaves (baseline)
-//   ADAPTIVE_THETA >  0 -> regions with local skew <= theta become ordered dense leaves
+// The leaf layout is the only knob changed, via one of two criteria:
+//   ADAPTIVE_THETA > 0        -> regions with local skew <= theta become ordered dense leaves
+//   LEAF_WINDOW_THRESHOLD > 0 -> regions whose p99 prediction error (slots) <= threshold become
+//                                ordered dense leaves; takes precedence over ADAPTIVE_THETA
+//   neither                   -> all hash leaves (baseline)
 //
 // Env: PILOT_DATASET (default uden.data), PILOT_LENGTH, PILOT_QUERIES
 //
@@ -64,6 +66,7 @@ int main() {
     Hits::leaf_cost = 0;
     Hits::leaf_max_cost = 0;
     Hits::leaf_skews.clear();
+    Hits::leaf_windows.clear();
     Hits::ordered_probe_sum = 0;
     Hits::ordered_lookup_count = 0;
     Hits::leaf_stats.clear();
@@ -102,7 +105,19 @@ int main() {
                double(Hits::ordered_probe_sum) / double(Hits::ordered_lookup_count),
                Hits::ordered_lookup_count);
     }
+    printf("  criterion: window_threshold=%.6g  theta=%.6g\n",
+           leaf_window_threshold, adaptive_theta);
     fflush(stdout);
+
+    // per-leaf p99 prediction error: the statistic the window criterion thresholded
+    if (!Hits::leaf_windows.empty()) {
+        auto w = Hits::leaf_windows;
+        std::sort(w.begin(), w.end());
+        auto pct = [&](double p) { return w[std::min(w.size() - 1, (size_t) (p * w.size()))]; };
+        printf("  window(p99,slots): min=%.2f p25=%.2f p50=%.2f p75=%.2f p99=%.2f max=%.2f  (leaves=%zu)\n",
+               w.front(), pct(0.25), pct(0.50), pct(0.75), pct(0.99), w.back(), w.size());
+        fflush(stdout);
+    }
 
     // per-leaf skew distribution
     if (!Hits::leaf_skews.empty()) {
@@ -134,11 +149,12 @@ int main() {
         std::string csv = std::string("leaf_stats_") + dataset_name + ".csv";
         FILE *f = std::fopen(csv.c_str(), "w");
         if (f) {
-            std::fprintf(f, "leaf_id,size,skew,lookups,avg_probe\n");
+            std::fprintf(f, "leaf_id,size,skew,window_p99,window_max,lookups,avg_probe\n");
             for (std::size_t i = 0; i < Hits::leaf_stats.size(); ++i) {
                 Hits::LeafStat &s = Hits::leaf_stats[i];
                 if (s.lookups > 0) {
-                    std::fprintf(f, "%zu,%d,%.6f,%lld,%.4f\n", i, s.size, s.skew, s.lookups,
+                    std::fprintf(f, "%zu,%d,%.6f,%.4f,%.4f,%lld,%.4f\n", i, s.size, s.skew,
+                                 s.window_p99, s.window_max, s.lookups,
                                  double(s.probe) / double(s.lookups));
                 }
             }

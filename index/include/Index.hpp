@@ -38,6 +38,14 @@ static double adaptive_theta = []() -> double {
     const char *s = std::getenv("ADAPTIVE_THETA");
     return s ? std::atof(s) : -1.0;
 }();
+// Leaf-form criterion #2: threshold on the leaf's own measured prediction error, in slots
+// (the "window" a point lookup has to search). Unlike a skew threshold this carries units,
+// so one value applies across leaf sizes. LEAF_WINDOW_THRESHOLD > 0 enables it and takes
+// precedence over ADAPTIVE_THETA.
+static double leaf_window_threshold = []() -> double {
+    const char *s = std::getenv("LEAF_WINDOW_THRESHOLD");
+    return s ? std::atof(s) : -1.0;
+}();
 //#define inner_cost_weight (float(6.01213))
 #define inner_cost_weight (float(60.01213))
 #define leaf_cost_weight (float(1.35074178))
@@ -84,6 +92,34 @@ inline double leaf_skew(
     return sum / (n_1 * n_1);
 }
 
+// Point-lookup cost model for a candidate ordered leaf. The linear model ranks a key at
+// p = (n-1)*(key-kmin)/(kmax-kmin); a lookup that misses must search |p - actual_rank|
+// slots. Reports the 99th percentile and the maximum of that error over the leaf's keys.
+// Requires keys sorted by key. Costs one O(n) pass, no extra sort.
+template<class key_T, class value_T>
+inline void leaf_prediction_error(
+        const std::vector<std::pair<key_T, value_T>> &keys,
+        double &p99_window, double &max_window) {
+    p99_window = 0;
+    max_window = 0;
+    const int n = int(keys.size());
+    if (n <= 1) { return; }
+    const double kmin = double(keys.front().first);
+    const double kmax = double(keys.back().first);
+    if (!(kmax > kmin)) { return; }//degenerate: all keys identical
+    std::vector<int> errors(n);
+    for (int i = 0; i < n; ++i) {
+        double p = double(n - 1) * (double(keys[i].first) - kmin) / (kmax - kmin);
+        if (p < 0) { p = 0; }
+        if (p > n - 1) { p = n - 1; }
+        errors[i] = std::abs(int(std::llround(p)) - i);
+    }
+    const std::size_t k = std::size_t(0.99 * double(n - 1));
+    std::nth_element(errors.begin(), errors.begin() + k, errors.end());
+    p99_window = double(errors[k]);
+    max_window = double(*std::max_element(errors.begin(), errors.end()));
+}
+
 namespace Hits {
     unsigned long long node_memory_count = 0;
     long long inner_cost = 0;
@@ -92,6 +128,7 @@ namespace Hits {
     unsigned long long leaf_count = 0;
     unsigned long long ordered_leaf_count = 0;
     std::vector<double> leaf_skews;//per-leaf local skew, for diagnosing the threshold
+    std::vector<double> leaf_windows;//per-leaf p99 prediction error, in slots
     long long ordered_probe_sum = 0;//sum of searched window sizes over ordered-leaf lookups
     long long ordered_lookup_count = 0;
 
@@ -102,6 +139,8 @@ namespace Hits {
         double skew;
         long long lookups;
         long long probe;
+        double window_p99;
+        double window_max;
     };
     std::vector<LeafStat> leaf_stats;
 
@@ -329,8 +368,10 @@ namespace Hits {
     };
 
 
-    // Pilot: build a leaf either as the original hash leaf or, when the region is not
-    // locally skewed (leaf_skew <= adaptive_theta), as a densely packed key-sorted leaf.
+    // Pilot: build a leaf either as the original hash leaf or, when the region is cheap to
+    // search with a linear model, as a densely packed key-sorted leaf. Criterion:
+    //   LEAF_WINDOW_THRESHOLD > 0 : measured p99 prediction error in slots <= threshold
+    //   otherwise                 : local skew <= ADAPTIVE_THETA
     template<class key_T, class value_T>
     DataNode<key_T, value_T> *build_leaf_(
             typename std::vector<std::pair<key_T, value_T>>::const_iterator begin,
@@ -339,25 +380,39 @@ namespace Hits {
         using data_node_type = DataNode<key_T, value_T>;
         auto data_count = int(end - begin);
         double skew = leaf_skew<key_T, value_T>(begin, end, lower, upper);
-        bool use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
+        // Both criteria and the ordered layout need the keys in order. The copy is skipped
+        // when every criterion is off, so the all-hash baseline path is left untouched.
+        std::vector<std::pair<key_T, value_T>> sorted_keys;
+        double window_p99 = 0;
+        double window_max = 0;
+        if (leaf_window_threshold > 0 || adaptive_theta > 0) {
+            sorted_keys.assign(begin, end);
+            std::sort(sorted_keys.begin(), sorted_keys.end(),
+                      [](const std::pair<key_T, value_T> &a, const std::pair<key_T, value_T> &b) {
+                          return a.first < b.first;
+                      });
+            leaf_prediction_error<key_T, value_T>(sorted_keys, window_p99, window_max);
+            leaf_windows.push_back(window_p99);
+        }
+        bool use_ordered;
+        if (leaf_window_threshold > 0) {
+            use_ordered = (window_p99 <= leaf_window_threshold) && (data_count > DATA_NODE_SIZE);
+        } else {
+            use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
+        }
         ++leaf_count;
         leaf_skews.push_back(skew);
         if (use_ordered) {
             ++ordered_leaf_count;
             auto node = data_node_type::new_segment(std::max(data_count, DATA_NODE_SIZE), lower, upper);
-            std::vector<std::pair<key_T, value_T>> tmp(begin, end);
-            std::sort(tmp.begin(), tmp.end(),
-                      [](const std::pair<key_T, value_T> &a, const std::pair<key_T, value_T> &b) {
-                          return a.first < b.first;
-                      });
             for (int i = 0; i < data_count; ++i) {
-                node->array[i] = tmp[i];
+                node->array[i] = sorted_keys[i];
                 set_bitmap(node->bitmap_start(), i);
             }
             node->size = data_count;
             node->ordered = 1;
             node->leaf_id = int(leaf_stats.size());
-            leaf_stats.push_back({data_count, skew, 0, 0});
+            leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max});
             return node;
         }
         auto node = data_node_type::new_segment(
@@ -371,7 +426,7 @@ namespace Hits {
             ++node->size;
         }
         node->leaf_id = int(leaf_stats.size());
-        leaf_stats.push_back({data_count, skew, 0, 0});
+        leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max});
         return node;
     }
 
