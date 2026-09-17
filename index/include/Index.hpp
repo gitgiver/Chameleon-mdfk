@@ -46,6 +46,23 @@ static double leaf_window_threshold = []() -> double {
     const char *s = std::getenv("LEAF_WINDOW_THRESHOLD");
     return s ? std::atof(s) : -1.0;
 }();
+// >>> FIXED-STRUCTURE EXPERIMENT MODE <<<
+// Deterministic replacement for the TSMDP fanout decision so that the tree shape and the leaf
+// sizes are set by the experiment rather than chosen per dataset by the policy. Needed to
+// attribute a measured difference to the leaf layout: with the policy in the loop, uden gets
+// ~142-key leaves and face ~14.7k-key leaves, so "ordered is cheap on uniform data" is
+// confounded with "its leaves are smaller". Both default to off, so the production path and
+// every existing measurement are unchanged.
+//   TARGET_LEAF   > 0 : keep splitting until a node holds at most this many keys
+//   TARGET_FANOUT     : branching factor for those splits (default 16)
+static int target_leaf = []() -> int {
+    const char *s = std::getenv("TARGET_LEAF");
+    return s ? std::atoi(s) : -1;
+}();
+static int target_fanout = []() -> int {
+    const char *s = std::getenv("TARGET_FANOUT");
+    return (s && std::atoi(s) > 0) ? std::atoi(s) : 16;
+}();
 //#define inner_cost_weight (float(6.01213))
 #define inner_cost_weight (float(60.01213))
 #define leaf_cost_weight (float(1.35074178))
@@ -136,6 +153,7 @@ namespace Hits {
     // the leaf's size or by its local skew.
     struct LeafStat {
         int size;
+        int ordered;//1 if this leaf was laid out ordered; lets rates be recomputed on subsets
         double skew;
         long long lookups;
         long long probe;
@@ -143,6 +161,8 @@ namespace Hits {
         double window_max;
         double interval_width;//upper - lower: the span leaf_skew normalizes by
         double key_span;//max key - min key actually present, i.e. what a linear model spans
+        double lower;//interval bounds, so the same leaf can be identified across runs
+        double upper;
     };
     std::vector<LeafStat> leaf_stats;
 
@@ -439,7 +459,7 @@ namespace Hits {
             node->size = data_count;
             node->ordered = 1;
             node->leaf_id = int(leaf_stats.size());
-            leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max, interval_width, key_span});
+            leaf_stats.push_back({data_count, use_ordered ? 1 : 0, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
             return node;
         }
         auto node = data_node_type::new_segment(
@@ -453,7 +473,7 @@ namespace Hits {
             ++node->size;
         }
         node->leaf_id = int(leaf_stats.size());
-        leaf_stats.push_back({data_count, skew, 0, 0, window_p99, window_max, interval_width, key_span});
+        leaf_stats.push_back({data_count, use_ordered ? 1 : 0, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
         return node;
     }
 
@@ -632,7 +652,9 @@ namespace Hits {
             auto pointer_result = std::pair<bool, void *>({false, nullptr});
             auto data_count = int(end - begin);
             int fanout = 1;
-            if (data_count > DATA_NODE_SIZE) {
+            if (target_leaf > 0) {
+                if (data_count > target_leaf) { fanout = target_fanout; }
+            } else if (data_count > DATA_NODE_SIZE) {
                 auto pdf = get_pdf<key_T, value_T>(begin, end, interval.first, interval.second, SMALL_PDF_SIZE);
                 auto a = torch::tensor(pdf).view({1, SMALL_PDF_SIZE}).mul(
                         torch::ones({int(action_space.size()), SMALL_PDF_SIZE})).to(GPU_DEVICE);
