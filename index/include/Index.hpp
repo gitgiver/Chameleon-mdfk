@@ -142,6 +142,12 @@ namespace Hits {
     long long inner_cost = 0;
     long long leaf_cost = 0;
     long long leaf_max_cost = 0;
+
+#ifdef PILOT_DIAGNOSTICS
+    // Per-leaf instrumentation used by the pilot harnesses. Off by default: it costs 8 bytes per
+    // leaf node and, worse, every lookup on an ordered leaf writes these, which is a data race
+    // once more than one thread reads concurrently. Build with -DPILOT_DIAGNOSTICS to measure.
+    static constexpr bool pilot_diagnostics = true;
     unsigned long long leaf_count = 0;
     unsigned long long ordered_leaf_count = 0;
     std::vector<double> leaf_skews;//per-leaf local skew, for diagnosing the threshold
@@ -165,6 +171,9 @@ namespace Hits {
         double upper;
     };
     std::vector<LeafStat> leaf_stats;
+#else
+    static constexpr bool pilot_diagnostics = false;
+#endif
 
     template<class key_T, class value_T>
     class DataNode {
@@ -184,7 +193,9 @@ namespace Hits {
         int size{};
         int max_offset{};
         int ordered{};//1 -> dense key-sorted leaf (pilot); 0 -> original hash leaf
+#ifdef PILOT_DIAGNOSTICS
         int leaf_id{-1};//index into Hits::leaf_stats, for diagnostics
+#endif
         slot_type array[0];
 
 
@@ -204,7 +215,9 @@ namespace Hits {
             node->size = 0;
             node->max_offset = 0;
             node->ordered = 0;
+#ifdef PILOT_DIAGNOSTICS
             node->leaf_id = -1;
+#endif
             unsigned int *bit_map = node->bitmap_start();
             for (int i = 0; i < t; ++i) {
                 bit_map[i] = 0;
@@ -261,6 +274,7 @@ namespace Hits {
             auto position = hash(key);
             auto left = position;
             auto right = position;
+#ifdef PILOT_DIAGNOSTICS
             // hash leaves must record too, otherwise per-leaf diagnostics only ever cover the
             // ordered population and the two leaf forms cannot be compared on the same leaf
             auto record = [&](int steps) {
@@ -269,6 +283,9 @@ namespace Hits {
                     leaf_stats[leaf_id].probe += steps;
                 }
             };
+#else
+            auto record = [](int) {};
+#endif
             for (int i = 0; i <= max_offset; ++i,--left,++right) {
                 if (left < 0) {
                     left += capacity;
@@ -332,8 +349,10 @@ namespace Hits {
                             lo = std::max(0, p - d);
                             hi = last - 1;
                         }
+#ifdef PILOT_DIAGNOSTICS
                         ordered_probe_sum += (hi - lo + 1);
                         ++ordered_lookup_count;
+#endif
                         while (lo <= hi) {
                             ++steps;
                             int mid = (lo + hi) >> 1;
@@ -344,11 +363,15 @@ namespace Hits {
                     }
                 }
             }
+#ifdef PILOT_DIAGNOSTICS
             if (leaf_id >= 0) {
                 LeafStat &st = leaf_stats[leaf_id];
                 ++st.lookups;
                 st.probe += steps;
             }
+#else
+            (void) steps;
+#endif
             return result;
         }
 
@@ -412,10 +435,54 @@ namespace Hits {
             double lower, double upper) {
         using data_node_type = DataNode<key_T, value_T>;
         auto data_count = int(end - begin);
-        double skew = leaf_skew<key_T, value_T>(begin, end, lower, upper);
-        // leaf_skew divides by (upper - lower) while the linear model spans the keys that are
-        // actually present. When the two differ, skew is inflated by their ratio, so record
-        // both to tell a real skew/window decoupling from a normalization artifact.
+
+        // Compute only what the active criterion needs. With every criterion off (the production
+        // default) this function does exactly what the original leaf construction did: no copy,
+        // no sort, no extra pass.
+        const bool want_skew = (adaptive_theta > 0) || pilot_diagnostics;
+        const bool want_window = (leaf_window_threshold > 0) || pilot_diagnostics;
+        // the ordered layout itself needs the keys in order, so the copy is also needed when the
+        // skew criterion could select it
+        const bool want_sorted = want_window || (adaptive_theta > 0);
+
+        double skew = 1.0;
+        if (want_skew) { skew = leaf_skew<key_T, value_T>(begin, end, lower, upper); }
+
+        std::vector<std::pair<key_T, value_T>> sorted_keys;
+        double window_p99 = 0;
+        double window_max = 0;
+        if (want_sorted) {
+            sorted_keys.assign(begin, end);
+            auto by_key = [](const std::pair<key_T, value_T> &a, const std::pair<key_T, value_T> &b) {
+                return a.first < b.first;
+            };
+            // bulk_load requires the caller to have sorted the dataset, so a leaf's slice is
+            // normally already ordered and the sort would be wasted work
+            if (!std::is_sorted(sorted_keys.begin(), sorted_keys.end(), by_key)) {
+                std::sort(sorted_keys.begin(), sorted_keys.end(), by_key);
+            }
+            if (want_window) {
+                leaf_prediction_error<key_T, value_T>(sorted_keys, window_p99, window_max);
+            }
+#ifdef PILOT_DIAGNOSTICS
+            leaf_windows.push_back(window_p99);
+#endif
+        }
+#ifndef PILOT_DIAGNOSTICS
+        (void) skew;
+#endif
+
+        bool use_ordered;
+        if (leaf_window_threshold > 0) {
+            use_ordered = (window_p99 <= leaf_window_threshold) && (data_count > DATA_NODE_SIZE);
+        } else {
+            use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
+        }
+
+#ifdef PILOT_DIAGNOSTICS
+        // leaf_skew divides by (upper - lower) while the linear model spans the keys actually
+        // present; record both so a real skew/window decoupling can be told from a normalization
+        // artifact
         double key_span = 0;
         if (data_count > 0) {
             double key_min = begin->first;
@@ -426,31 +493,15 @@ namespace Hits {
             }
             key_span = key_max - key_min;
         }
-        double interval_width = upper - lower;
-        // Both criteria and the ordered layout need the keys in order. The copy is skipped
-        // when every criterion is off, so the all-hash baseline path is left untouched.
-        std::vector<std::pair<key_T, value_T>> sorted_keys;
-        double window_p99 = 0;
-        double window_max = 0;
-        if (leaf_window_threshold > 0 || adaptive_theta > 0) {
-            sorted_keys.assign(begin, end);
-            std::sort(sorted_keys.begin(), sorted_keys.end(),
-                      [](const std::pair<key_T, value_T> &a, const std::pair<key_T, value_T> &b) {
-                          return a.first < b.first;
-                      });
-            leaf_prediction_error<key_T, value_T>(sorted_keys, window_p99, window_max);
-            leaf_windows.push_back(window_p99);
-        }
-        bool use_ordered;
-        if (leaf_window_threshold > 0) {
-            use_ordered = (window_p99 <= leaf_window_threshold) && (data_count > DATA_NODE_SIZE);
-        } else {
-            use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
-        }
+        const double interval_width = upper - lower;
         ++leaf_count;
         leaf_skews.push_back(skew);
+#endif
+
         if (use_ordered) {
+#ifdef PILOT_DIAGNOSTICS
             ++ordered_leaf_count;
+#endif
             auto node = data_node_type::new_segment(std::max(data_count, DATA_NODE_SIZE), lower, upper);
             for (int i = 0; i < data_count; ++i) {
                 node->array[i] = sorted_keys[i];
@@ -458,8 +509,10 @@ namespace Hits {
             }
             node->size = data_count;
             node->ordered = 1;
+#ifdef PILOT_DIAGNOSTICS
             node->leaf_id = int(leaf_stats.size());
-            leaf_stats.push_back({data_count, use_ordered ? 1 : 0, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
+            leaf_stats.push_back({data_count, 1, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
+#endif
             return node;
         }
         auto node = data_node_type::new_segment(
@@ -472,8 +525,10 @@ namespace Hits {
             set_bitmap(node->bitmap_start(), position);
             ++node->size;
         }
+#ifdef PILOT_DIAGNOSTICS
         node->leaf_id = int(leaf_stats.size());
-        leaf_stats.push_back({data_count, use_ordered ? 1 : 0, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
+        leaf_stats.push_back({data_count, 0, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
+#endif
         return node;
     }
 

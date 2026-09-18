@@ -32,6 +32,9 @@
 #include "../include/DEFINE.h"
 
 #define using_small_network
+// per-leaf instrumentation (leaf_stats, leaf_id, the distribution prints below). Costs 8 bytes
+// per leaf and writes shared state on every lookup, so it is off unless a harness asks for it.
+#define PILOT_DIAGNOSTICS
 
 #include "../index/include/Index.hpp"
 #include "../include/DataSet.hpp"
