@@ -82,6 +82,8 @@ add_executable(read_only benchmark/read_only.cpp)
 
 add_executable(pilot_leaf benchmark/pilot_leaf.cpp)
 
+add_executable(pilot_range benchmark/pilot_range.cpp)
+
 # benchmark/test.cpp includes ../others/other_indexes.h. The b+tree/alex/pgm/lipp
 # baselines are not part of this repository, so this target cannot be built.
 # add_executable(test benchmark/test.cpp )

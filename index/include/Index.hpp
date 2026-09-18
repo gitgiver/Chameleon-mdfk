@@ -605,6 +605,49 @@ namespace Hits {
         }
         return result;
     }
+    // ---- range query: walk the tree in key order, collect keys in [lo, hi] ----
+    // An inner node's children are ordered by key interval (array index == key order), so the
+    // walk can skip subtrees entirely below the range and stop at the first one above it.
+    template<class key_T, class value_T>
+    void range_collect_leaf(DataNode<key_T, value_T> *leaf, key_T lo, key_T hi,
+                            std::vector<std::pair<key_T, value_T>> &out) {
+        if (leaf->ordered) {
+            // keys are packed in slots [0, size) in sorted order, so the lower bound is a
+            // binary search and the scan then stops at the first key above the range
+            auto first = leaf->array;
+            auto last = leaf->array + leaf->size;
+            auto it = std::lower_bound(first, last, lo,
+                                       [](const std::pair<key_T, value_T> &a, key_T v) {
+                                           return a.first < v;
+                                       });
+            for (; it != last && it->first <= hi; ++it) { out.push_back(*it); }
+            return;
+        }
+        // hash leaf: slot order is not key order, so every slot must be examined and a slot
+        // above the range cannot terminate the scan
+        for (int i = 0; i < leaf->capacity; ++i) {
+            if (!get_bitmap(leaf->bitmap_start(), i)) { continue; }
+            key_T k = leaf->array[i].first;
+            if (k < lo || k > hi) { continue; }
+            out.push_back(leaf->array[i]);
+        }
+    }
+
+    template<class key_T, class value_T>
+    void range_collect_node(InnerNode<key_T, value_T> *node, key_T lo, key_T hi,
+                            std::vector<std::pair<key_T, value_T>> &out) {
+        for (int i = 0; i < node->capacity; ++i) {
+            auto interval = node->sub_interval(i);
+            if (interval.second <= lo) { continue; }//entirely below the range
+            if (interval.first > hi) { break; }     //ordered children: nothing above can match
+            if (get_bitmap(node->bitmap_start(), i)) {
+                range_collect_node<key_T, value_T>(node->array[i].inner_node, lo, hi, out);
+            } else {
+                range_collect_leaf<key_T, value_T>(node->array[i].data_node, lo, hi, out);
+            }
+        }
+    }
+
     template<class key_T, class value_T>
     class Index {
     public:
@@ -875,6 +918,14 @@ namespace Hits {
             pred -= left;
             return int(0.5 + this->conf.fan_outs[std::min(INNER_FANOUT_ROW - 1, layer)][left] * (1 - pred) +
                        this->conf.fan_outs[std::min(INNER_FANOUT_ROW - 1, layer)][left + 1] * pred);
+        }
+
+        // Collect every entry whose key lies in [lo, hi]. The result is in key order for ordered
+        // leaves and in slot order for hash leaves, so a caller comparing the two leaf forms must
+        // treat it as a multiset.
+        void range_query(key_T lo, key_T hi, std::vector<std::pair<key_T, value_T>> &out) const {
+            out.clear();
+            range_collect_node<key_T, value_T>(root, lo, hi, out);
         }
 
         bool add(key_T key, const value_T &value) {
