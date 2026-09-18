@@ -1,0 +1,4 @@
+run: mixed.data_n20000000_w1e+09_conf256x16_tl1024x16_r0p001 (selectivity=0.001 fixed_conf=1 target_leaf=1024 target_fanout=16)
+  leaf size: min=0 p25=1 p50=71 p75=92 p99=962 max=1024 | mean=155.9 size_weighted_mean=634.4 | <=5 keys: 26.9%
+  window(p99,slots): min=0.00 p25=0.00 p50=5.00 p90=29.00 p99=180.00 max=226.00
+selectivity=0.001    span=20000    queries=10000    leaves=128266 ordered=73.1%(elig 100.0%) mem_ratio=1.0373  result_avg=20001.0   ns=68384.06  (med 68916.25 max 69709.25, 4 passes) ns_per_result=3.4190 errors=0

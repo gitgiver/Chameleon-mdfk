@@ -1,0 +1,3 @@
+run: local_skew.data_n19999999_base_conf256x16_tl1024x16_r1e-06 (selectivity=1e-06 fixed_conf=1 target_leaf=1024 target_fanout=16)
+  leaf size: min=0 p25=15 p50=81 p75=135 p99=773 max=1024 | mean=94.3 size_weighted_mean=251.9 | <=5 keys: 19.4%
+selectivity=1e-06    span=19       queries=2000000  leaves=212011 ordered=0.0%(elig 0.0%) mem_ratio=1.5903  result_avg=20.0      ns=3754.53   (med 3794.33 max 3799.20, 4 passes) ns_per_result=187.7267 errors=0

@@ -1,0 +1,2 @@
+run: face.data_n20000000_w1e+09_conf256x16_tl1024x16_r0p0001 (selectivity=0.0001 fixed_conf=1 target_leaf=1024 target_fanout=16)
+selectivity=0.0001   span=2000     queries=100000   leaves=99931  ordered=93.9%(elig 100.0%) mem_ratio=1.0251  result_avg=2001.0    ns=8820.20   (med 10864.89 max 12137.34, 4 passes) ns_per_result=4.4079 errors=0

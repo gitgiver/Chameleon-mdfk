@@ -1,0 +1,2 @@
+run: uden.data_n20000000_base_conf256x16_tl1024x16_r0p01 (selectivity=0.01 fixed_conf=1 target_leaf=1024 target_fanout=16)
+selectivity=0.01     span=200000   queries=1000     leaves=65536  ordered=0.0%(elig 0.0%) mem_ratio=1.5600  result_avg=200001.0  ns=709899.27 (med 764641.67 max 959923.58, 4 passes) ns_per_result=3.5495 errors=0

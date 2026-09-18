@@ -222,3 +222,5 @@ FIXED_CONF=256,16 TARGET_LEAF=1024 LEAF_WINDOW_THRESHOLD=16 ./pilot_leaf
 叶数、合格分母、errors)、`Release/leaf_stats_<tag>.csv`(逐叶 `size, ordered, skew,
 window_p99, window_max, interval_width, key_span, lower, upper, lookups, avg_probe`)。
 后者带叶子区间边界,是为了把两次运行(全哈希/全有序)按区间 join 成逐叶配对样本。
+
+**已发布的快照见仓库的 `results/`**(汇总表 + 范围实验的运行日志;逐叶转储约 193 MB,未纳入)。

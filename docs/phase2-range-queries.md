@@ -225,3 +225,5 @@ EMIT=200000000 DS=face.data ../scripts/sweep_range.sh /tmp/f2.csv
 
 产物:`Release/pilot_range.csv`(每次运行一行,含结构、选择性、结果数、延迟 min/median/max、
 errors)、`Release/logs_range/<dataset>_s<s>_<mode>.log`(含叶大小与窗口分布打印)。
+
+**已发布的快照见仓库的 `results/`**(两份汇总表 + `logs_range/` 全部运行日志 + 说明)。
