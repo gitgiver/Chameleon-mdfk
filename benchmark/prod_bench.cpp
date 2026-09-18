@@ -112,11 +112,9 @@ int main() {
            mem_bytes / (1024.0 * 1024.0), mem_ratio, build_ms);
 
     std::mt19937_64 rng(1000);
-    std::vector<double> measured;
-    measured.reserve(repeats);
 
-    if (range_env == nullptr) {
-        // ---- point queries ----
+    // ---- point queries ----
+    {
         std::uniform_int_distribution<long> dist(0, n - 1);
         const long per_pass = std::max<long>(1, n_queries / repeats);
         VALUE_TYPE value;
@@ -131,66 +129,80 @@ int main() {
             auto t1 = std::chrono::high_resolution_clock::now();
             pass_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(per_pass));
         }
-        measured.assign(pass_ns.begin() + 1, pass_ns.end());
+        std::vector<double> measured(pass_ns.begin() + 1, pass_ns.end());
         std::sort(measured.begin(), measured.end());
-        printf("  point: ns=%.2f (med %.2f max %.2f, %zu passes x %ld) queries=%ld errors=%ld\n",
-               measured.front(), measured[measured.size() / 2], measured.back(),
-               measured.size(), per_pass, per_pass * (long) measured.size(), errors);
-    } else {
-        // ---- range queries: [lo,hi] spanning a fixed fraction s of the dataset ----
-        const double s = std::atof(range_env);
-        const long span = std::max(1L, (long) (s * double(n)));
-        const long queries = std::max(200L, std::min(2000000L, 200000000L / span));
-        std::uniform_int_distribution<long> dist(0, std::max<long>(0, n - span - 1));
-        std::vector<long> starts(queries);
-        for (long q = 0; q < queries; ++q) { starts[q] = dist(rng); }
+        printf("  point: queries=%-9ld ns=%.2f (med %.2f max %.2f, %zu passes) errors=%ld\n",
+               per_pass * (long) measured.size(), measured.front(),
+               measured[measured.size() / 2], measured.back(), measured.size(), errors);
+        fflush(stdout);
+    }
 
-        std::vector<std::pair<KEY_TYPE, VALUE_TYPE>> out;
-        out.reserve((size_t) std::min<long>(2 * span + 16, 2000000L));
-        long errors = 0;
-        long long emitted = 0;
-        long verified = 0;
+    // ---- range queries: [lo,hi] spanning a fixed fraction s of the dataset.
+    // PROD_RANGE takes a comma-separated list, so one build serves every selectivity: the
+    // structure and the leaf layout do not depend on s.
+    if (range_env != nullptr) {
+        std::vector<double> sels;
+        for (const char *p = range_env, *q = range_env; ; ++q) {
+            if (*q == ',' || *q == '\0') {
+                if (q > p) { sels.push_back(std::atof(std::string(p, q - p).c_str())); }
+                if (*q == '\0') { break; }
+                p = q + 1;
+            }
+        }
         auto by_key = [](const std::pair<KEY_TYPE, VALUE_TYPE> &a, KEY_TYPE v) { return a.first < v; };
         auto above = [](KEY_TYPE v, const std::pair<KEY_TYPE, VALUE_TYPE> &a) { return v < a.first; };
-        std::vector<double> pass_ns;
-        for (int rep = 0; rep < repeats; ++rep) {
-            auto t0 = std::chrono::high_resolution_clock::now();
+        for (double s: sels) {
+            const long span = std::max(1L, (long) (s * double(n)));
+            const long queries = std::max(200L, std::min(2000000L, 200000000L / span));
+            std::uniform_int_distribution<long> dist(0, std::max<long>(0, n - span - 1));
+            std::vector<long> starts(queries);
+            for (long q = 0; q < queries; ++q) { starts[q] = dist(rng); }
+
+            std::vector<std::pair<KEY_TYPE, VALUE_TYPE>> out;
+            out.reserve((size_t) std::min<long>(2 * span + 16, 2000000L));
+            long errors = 0;
+            long long emitted = 0;
+            long verified = 0;
+            std::vector<double> pass_ns;
+            for (int rep = 0; rep < repeats; ++rep) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (long q = 0; q < queries; ++q) {
+                    const long st = starts[q];
+                    index->range_query(dataset[st].first, dataset[st + span].first, out);
+                    emitted += (long long) out.size();
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                pass_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(queries));
+            }
+            std::vector<double> measured(pass_ns.begin() + 1, pass_ns.end());
+            std::sort(measured.begin(), measured.end());
+            // correctness against the brute-force oracle (untimed)
             for (long q = 0; q < queries; ++q) {
                 const long st = starts[q];
-                index->range_query(dataset[st].first, dataset[st + span].first, out);
-                emitted += (long long) out.size();
+                const KEY_TYPE lo = dataset[st].first;
+                const KEY_TYPE hi = dataset[st + span].first;
+                index->range_query(lo, hi, out);
+                auto a = std::lower_bound(dataset.begin(), dataset.end(), lo, by_key);
+                auto b = std::upper_bound(dataset.begin(), dataset.end(), hi, above);
+                if ((long) out.size() != (long) (b - a)) { ++errors; continue; }
+                if (q < 200) {
+                    std::sort(out.begin(), out.end(),
+                              [](const std::pair<KEY_TYPE, VALUE_TYPE> &x, const std::pair<KEY_TYPE, VALUE_TYPE> &y) {
+                                  return x.first < y.first;
+                              });
+                    if (!std::equal(out.begin(), out.end(), a)) { ++errors; }
+                    ++verified;
+                }
             }
-            auto t1 = std::chrono::high_resolution_clock::now();
-            pass_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(queries));
+            const double result_avg = double(emitted) / double(queries * repeats);
+            printf("  range: s=%-9g span=%-7ld queries=%-7ld result_avg=%-8.1f ns=%.2f "
+                   "(med %.2f max %.2f, %zu passes) ns_per_result=%.4f verified=%ld errors=%ld\n",
+                   s, span, queries, result_avg, measured.front(),
+                   measured[measured.size() / 2], measured.back(), measured.size(),
+                   measured.front() / std::max(1.0, result_avg), verified, errors);
+            fflush(stdout);
         }
-        measured.assign(pass_ns.begin() + 1, pass_ns.end());
-        std::sort(measured.begin(), measured.end());
-        // correctness against the brute-force oracle (untimed)
-        for (long q = 0; q < queries; ++q) {
-            const long st = starts[q];
-            const KEY_TYPE lo = dataset[st].first;
-            const KEY_TYPE hi = dataset[st + span].first;
-            index->range_query(lo, hi, out);
-            auto a = std::lower_bound(dataset.begin(), dataset.end(), lo, by_key);
-            auto b = std::upper_bound(dataset.begin(), dataset.end(), hi, above);
-            if ((long) out.size() != (long) (b - a)) { ++errors; continue; }
-            if (q < 200) {
-                std::sort(out.begin(), out.end(),
-                          [](const std::pair<KEY_TYPE, VALUE_TYPE> &x, const std::pair<KEY_TYPE, VALUE_TYPE> &y) {
-                              return x.first < y.first;
-                          });
-                if (!std::equal(out.begin(), out.end(), a)) { ++errors; }
-                ++verified;
-            }
-        }
-        const double result_avg = double(emitted) / double(queries * repeats);
-        printf("  range: s=%-9g span=%-7ld queries=%-7ld result_avg=%-8.1f ns=%.2f "
-               "(med %.2f max %.2f, %zu passes) ns_per_result=%.4f verified=%ld errors=%ld\n",
-               s, span, queries, result_avg, measured.front(),
-               measured[measured.size() / 2], measured.back(), measured.size(),
-               measured.front() / std::max(1.0, result_avg), verified, errors);
     }
-    fflush(stdout);
 
     delete index;
     return 0;
