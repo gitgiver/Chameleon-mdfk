@@ -1,0 +1,7 @@
+prod: dataset=uden.data        n=20000000  structure=policy root=417    leaves=141061  size_weighted_leaf=640.2   mem_MB=313.24   mem_ratio=1.0264  build_ms=80535
+  point: queries=32000000  ns=193.77 (med 197.25 max 206.42, 4 passes) errors=0
+  range: s=1e-06     span=20      queries=2000000 result_avg=21.0     ns=1300.49 (med 1318.59 max 1320.59, 4 passes) ns_per_result=61.9279 verified=200 errors=0
+  range: s=1e-05     span=200     queries=1000000 result_avg=201.0    ns=1994.65 (med 2009.06 max 2037.85, 4 passes) ns_per_result=9.9236 verified=200 errors=0
+  range: s=0.0001    span=2000    queries=100000  result_avg=2001.0   ns=7049.75 (med 7174.56 max 7187.38, 4 passes) ns_per_result=3.5231 verified=200 errors=0
+  range: s=0.001     span=20000   queries=10000   result_avg=20001.0  ns=55816.09 (med 56408.45 max 57000.63, 4 passes) ns_per_result=2.7907 verified=200 errors=0
+  range: s=0.01      span=200000  queries=1000    result_avg=200001.0 ns=527365.67 (med 546103.63 max 546600.14, 4 passes) ns_per_result=2.6368 verified=200 errors=0

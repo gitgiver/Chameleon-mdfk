@@ -1,0 +1,2 @@
+prod: dataset=face.data        n=20000000  structure=policy root=5      leaves=1363    size_weighted_leaf=24614.3 mem_MB=473.22   mem_ratio=1.5506  build_ms=1787
+  point: queries=32000000  ns=157.46 (med 189.07 max 192.39, 4 passes) errors=0
