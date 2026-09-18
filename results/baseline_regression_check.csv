@@ -1,0 +1,4 @@
+tag,dataset,n,window_threshold,theta,conf_source,root_fanout,fixed_inner,target_leaf,target_fanout,leaves,leaves_small,leaves_eligible,ordered,ordered_pct_all,ordered_pct_eligible,mem_ratio,get_ns_min,get_ns_median,get_ns_max,passes,queries_per_pass,errors
+uden.data_n20000000_base_rl,uden.data,20000000,-1,-1,policy,417,-1,-1,16,141061,0,141061,0,0.000,0.000,1.569387,260.514,264.674,267.436,4,8000000,0
+uden.data_n20000000_base_rl,uden.data,20000000,-1,-1,policy,417,-1,-1,16,141061,0,141061,0,0.000,0.000,1.569387,266.144,272.760,272.760,2,2666666,0
+uden.data_n20000000_base_rl,uden.data,20000000,-1,-1,policy,417,-1,-1,16,141061,0,141061,0,0.000,0.000,1.569387,264.553,267.240,267.240,2,2666666,0

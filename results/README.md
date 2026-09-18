@@ -13,6 +13,7 @@
 | `pilot_range.csv` | **范围**扫描。每次运行一行:选择性 `s`、区间键数、查询数、结构、有序叶占比、`mem_ratio`、平均结果数、延迟 min/median/max、`ns_per_result`、`errors` |
 | `logs_range/` | 范围扫描每次运行的完整 stdout,含**叶大小分布**与**窗口(p99 预测误差)分布**——机制分析(按大小加权的叶大小等)的数据来源 |
 | `pilot_range_early.csv` | 早期一批 face 运行。当时用 `LEAF_WINDOW_THRESHOLD=16`,只转换了 26% 的叶,因此测到的是"全哈希 vs 1/4 有序"的混合体(见阶段二文档 §5.1)。保留作为方法教训的原始记录 |
+| `baseline_regression_check.csv` | 关闭判据、走原策略结构(root=417)的 uden 20M 基线,用于与早期 pilot 记录做回归对照:结构逐项相同(root/叶数/内节点跳数),内存差 0.22% 恰好等于诊断字段的 8 字节/叶 |
 
 ## 关键设置
 

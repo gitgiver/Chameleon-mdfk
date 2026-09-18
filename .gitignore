@@ -7,3 +7,8 @@ cmake-build-*/
 # Local datasets, trained models, RL experience and logs (see index/include/Parameter.h)
 data/
 logfile.txt
+
+# The harnesses write their outputs relative to the working directory, so running one from the
+# repository root drops CSVs next to the sources. Published snapshots live in results/ and are
+# added explicitly with -f.
+/*.csv
