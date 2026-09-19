@@ -1,0 +1,7 @@
+prod: dataset=face.data        n=50000000  structure=policy root=755    leaves=287060  size_weighted_leaf=1270.8  mem_MB=1190.49  mem_ratio=1.5604  build_ms=148452
+  point: queries=32000000  ns=262.45 (med 265.35 max 266.03, 4 passes) errors=0
+  range: s=1e-06     span=50      queries=2000000 result_avg=51.0     ns=14153.92 (med 14180.47 max 14200.00, 4 passes) ns_per_result=277.5279 verified=200 errors=0
+  range: s=1e-05     span=500     queries=400000  result_avg=501.0    ns=19215.97 (med 19427.18 max 19434.27, 4 passes) ns_per_result=38.3552 verified=200 errors=0
+  range: s=0.0001    span=5000    queries=40000   result_avg=5001.0   ns=56804.57 (med 57369.14 max 57734.63, 4 passes) ns_per_result=11.3586 verified=200 errors=0
+  range: s=0.001     span=50000   queries=4000    result_avg=50001.0  ns=419161.06 (med 419646.59 max 421096.74, 4 passes) ns_per_result=8.3831 verified=200 errors=0
+  range: s=0.01      span=500000  queries=400     result_avg=500001.0 ns=3970849.93 (med 4028798.04 max 4029485.55, 4 passes) ns_per_result=7.9417 verified=200 errors=0
