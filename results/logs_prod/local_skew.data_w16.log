@@ -1,0 +1,2 @@
+prod: dataset=local_skew.data  n=19999999  structure=policy root=6      leaves=1374    size_weighted_leaf=50322.6 mem_MB=473.22   mem_ratio=1.5506  build_ms=1965
+  point: queries=32000000  ns=156.43 (med 159.48 max 160.42, 4 passes) errors=0

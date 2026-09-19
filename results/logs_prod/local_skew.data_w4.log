@@ -1,0 +1,7 @@
+prod: dataset=local_skew.data  n=19999999  structure=policy root=6      leaves=1374    size_weighted_leaf=50322.6 mem_MB=473.22   mem_ratio=1.5506  build_ms=1991
+  point: queries=32000000  ns=160.73 (med 163.79 max 172.86, 4 passes) errors=0
+  range: s=1e-06     span=19      queries=2000000 result_avg=20.0     ns=442045.61 (med 442346.13 max 443800.26, 4 passes) ns_per_result=22102.2806 verified=200 errors=0
+  range: s=1e-05     span=199     queries=1005025 result_avg=200.0    ns=445113.17 (med 445625.45 max 446441.09, 4 passes) ns_per_result=2225.5659 verified=200 errors=0
+  range: s=0.0001    span=1999    queries=100050  result_avg=2000.0   ns=473919.05 (med 475684.92 max 476602.31, 4 passes) ns_per_result=236.9595 verified=200 errors=0
+  range: s=0.001     span=19999   queries=10000   result_avg=20000.0  ns=641626.20 (med 642667.71 max 646278.36, 4 passes) ns_per_result=32.0813 verified=200 errors=0
+  range: s=0.01      span=199999  queries=1000    result_avg=200000.0 ns=1989552.98 (med 2012398.82 max 2014279.70, 4 passes) ns_per_result=9.9478 verified=200 errors=0
