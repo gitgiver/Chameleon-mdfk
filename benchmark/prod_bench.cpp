@@ -12,8 +12,14 @@
 //                                error, in slots, is within the threshold
 //   unset                     -> every leaf stays a hash leaf (baseline)
 //
-// Env: PROD_DATASET (default uden.data), PROD_LENGTH, PROD_QUERIES, PROD_RANGE, PROD_REPEATS,
+// Env: PROD_DATASET (default uden.data), PROD_LENGTH, PROD_QUERIES, PROD_REPEATS,
 //      FIXED_CONF=<root>,<inner> overrides the agents' structure choice
+// Range workload, two modes (both may be requested in one run):
+//   PROD_RANGE=<s,...>      selectivity mode: the span is s*n in RANK units, so the result count
+//                           is span+1 whatever the data looks like
+//   PROD_RANGE_W=<W,...>    key-value mode: start a is a random key from the data, end is a+W in
+//                           KEY units, so the result count is whatever the local density gives
+//                           (PROD_RANGE_W_QUERIES, default 20000, sets the query count)
 //
 
 #include <iostream>
@@ -199,6 +205,86 @@ int main() {
                    "(med %.2f max %.2f, %zu passes) ns_per_result=%.4f verified=%ld errors=%ld\n",
                    s, span, queries, result_avg, measured.front(),
                    measured[measured.size() / 2], measured.back(), measured.size(),
+                   measured.front() / std::max(1.0, result_avg), verified, errors);
+            fflush(stdout);
+        }
+    }
+
+    // ---- range queries #2: fixed KEY-VALUE width. The start a is a random key drawn from the data
+    // (uniform over ranks) and the end is a + W in key units, so the number of keys inside is
+    // whatever the local density gives. This complements the selectivity mode above, which holds
+    // the result count fixed. PROD_RANGE_W is a comma-separated list of widths in key units;
+    // PROD_RANGE_W_QUERIES (default 20000) sets the query count, which cannot be derived from a
+    // target emitted volume here because the emitted volume is data-dependent.
+    const char *rw_env = std::getenv("PROD_RANGE_W");
+    if (rw_env != nullptr) {
+        std::vector<double> widths;
+        for (const char *p = rw_env, *q = rw_env; ; ++q) {
+            if (*q == ',' || *q == '\0') {
+                if (q > p) { widths.push_back(std::atof(std::string(p, q - p).c_str())); }
+                if (*q == '\0') { break; }
+                p = q + 1;
+            }
+        }
+        const long w_queries = std::getenv("PROD_RANGE_W_QUERIES")
+                               ? std::atol(std::getenv("PROD_RANGE_W_QUERIES")) : 20000L;
+        auto by_key = [](const std::pair<KEY_TYPE, VALUE_TYPE> &a, KEY_TYPE v) { return a.first < v; };
+        auto above = [](KEY_TYPE v, const std::pair<KEY_TYPE, VALUE_TYPE> &a) { return v < a.first; };
+        for (double W: widths) {
+            std::uniform_int_distribution<long> dist(0, n - 1);
+            std::vector<long> starts(w_queries);
+            for (long q = 0; q < w_queries; ++q) { starts[q] = dist(rng); }
+
+            std::vector<std::pair<KEY_TYPE, VALUE_TYPE>> out;
+            out.reserve(1 << 20);
+            std::vector<long> sizes(w_queries, 0);
+            long errors = 0;
+            long long emitted = 0;
+            long verified = 0;
+            std::vector<double> pass_ns;
+            for (int rep = 0; rep < repeats; ++rep) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (long q = 0; q < w_queries; ++q) {
+                    const KEY_TYPE lo = dataset[starts[q]].first;
+                    index->range_query(lo, lo + W, out);
+                    sizes[q] = (long) out.size();
+                    emitted += (long long) out.size();
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                pass_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(w_queries));
+            }
+            std::vector<double> measured(pass_ns.begin() + 1, pass_ns.end());
+            std::sort(measured.begin(), measured.end());
+            // correctness (untimed): count for every query, multiset for the first 200
+            long zeros = 0;
+            for (long q = 0; q < w_queries; ++q) {
+                const KEY_TYPE lo = dataset[starts[q]].first;
+                const KEY_TYPE hi = lo + W;
+                index->range_query(lo, hi, out);
+                if (out.empty()) { ++zeros; }
+                auto a = std::lower_bound(dataset.begin(), dataset.end(), lo, by_key);
+                auto b = std::upper_bound(dataset.begin(), dataset.end(), hi, above);
+                if ((long) out.size() != (long) (b - a)) { ++errors; continue; }
+                if (q < 200) {
+                    std::sort(out.begin(), out.end(),
+                              [](const std::pair<KEY_TYPE, VALUE_TYPE> &x, const std::pair<KEY_TYPE, VALUE_TYPE> &y) {
+                                  return x.first < y.first;
+                              });
+                    if (!std::equal(out.begin(), out.end(), a)) { ++errors; }
+                    ++verified;
+                }
+            }
+            auto sorted_sizes = sizes;
+            std::sort(sorted_sizes.begin(), sorted_sizes.end());
+            auto sq = [&](double p) {
+                return sorted_sizes[std::min(sorted_sizes.size() - 1, (size_t) (p * sorted_sizes.size()))];
+            };
+            const double result_avg = double(emitted) / double(w_queries * repeats);
+            printf("  rangeW: W=%-9g queries=%-7ld result min=%-6ld p50=%-7ld p90=%-8ld p99=%-8ld max=%-8ld "
+                   "zero=%.1f%% avg=%.1f ns=%.2f (med %.2f max %.2f, %zu passes) ns_per_result=%.4f verified=%ld errors=%ld\n",
+                   W, w_queries, sorted_sizes.front(), sq(0.50), sq(0.90), sq(0.99), sorted_sizes.back(),
+                   100.0 * double(zeros) / double(w_queries), result_avg,
+                   measured.front(), measured[measured.size() / 2], measured.back(), measured.size(),
                    measured.front() / std::max(1.0, result_avg), verified, errors);
             fflush(stdout);
         }
