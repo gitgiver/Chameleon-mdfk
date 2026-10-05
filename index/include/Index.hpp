@@ -63,6 +63,12 @@ static int target_fanout = []() -> int {
     const char *s = std::getenv("TARGET_FANOUT");
     return (s && std::atoi(s) > 0) ? std::atoi(s) : 16;
 }();
+// LEAF_COST_DECISION > 0 : decide ordered vs hash by measuring both leaf forms' (query + memory)
+// cost under the agents' reward weights, instead of a window/skew threshold. See build_leaf_.
+static int leaf_cost_decision = []() -> int {
+    const char *s = std::getenv("LEAF_COST_DECISION");
+    return s ? std::atoi(s) : 0;
+}();
 //#define inner_cost_weight (float(6.01213))
 #define inner_cost_weight (float(60.01213))
 #define leaf_cost_weight (float(1.35074178))
@@ -135,6 +141,50 @@ inline void leaf_prediction_error(
     std::nth_element(errors.begin(), errors.begin() + k, errors.end());
     p99_window = double(errors[k]);
     max_window = double(*std::max_element(errors.begin(), errors.end()));
+}
+
+// Mean point-lookup step count of the ordered (dense sorted) leaf, averaged over its keys: the
+// prediction access, then the gallop and binary search of find_ordered. Mirrors find_ordered so the
+// number is the work a lookup actually pays. Used by the two-sided leaf decision (build_leaf_).
+template<class key_T, class value_T>
+inline double mean_ordered_steps(const std::vector<std::pair<key_T, value_T>> &keys) {
+    const int n = int(keys.size());
+    if (n <= 1) { return 1.0; }
+    const double kmin = double(keys.front().first);
+    const double kmax = double(keys.back().first);
+    if (!(kmax > kmin)) { return 1.0; }//degenerate: all keys identical
+    long long total = 0;
+    for (int i = 0; i < n; ++i) {
+        const double key = double(keys[i].first);
+        int p = int(double(n - 1) * (key - kmin) / (kmax - kmin));
+        if (p < 0) { p = 0; }
+        if (p > n - 1) { p = n - 1; }
+        long long steps = 1;//the prediction access
+        if (double(keys[p].first) == key) { total += steps; continue; }
+        int lo;
+        int hi;
+        if (double(keys[p].first) < key) {//key lies to the right of the prediction
+            int last = p;
+            int d = 1;
+            while (p + d < n && double(keys[p + d].first) < key) { last = p + d; d <<= 1; ++steps; }
+            lo = last + 1;
+            hi = std::min(n - 1, p + d);
+        } else {//key lies to the left of the prediction
+            int last = p;
+            int d = 1;
+            while (p - d >= 0 && double(keys[p - d].first) > key) { last = p - d; d <<= 1; ++steps; }
+            lo = std::max(0, p - d);
+            hi = last - 1;
+        }
+        while (lo <= hi) {
+            ++steps;
+            int mid = (lo + hi) >> 1;
+            if (double(keys[mid].first) == key) { break; }
+            if (double(keys[mid].first) < key) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        total += steps;
+    }
+    return double(total) / double(n);
 }
 
 namespace Hits {
@@ -443,7 +493,7 @@ namespace Hits {
         const bool want_window = (leaf_window_threshold > 0) || pilot_diagnostics;
         // the ordered layout itself needs the keys in order, so the copy is also needed when the
         // skew criterion could select it
-        const bool want_sorted = want_window || (adaptive_theta > 0);
+        const bool want_sorted = want_window || (adaptive_theta > 0) || (leaf_cost_decision > 0);
 
         double skew = 1.0;
         if (want_skew) { skew = leaf_skew<key_T, value_T>(begin, end, lower, upper); }
@@ -472,8 +522,53 @@ namespace Hits {
         (void) skew;
 #endif
 
+        // ---- two-sided leaf decision (LEAF_COST_DECISION) ----
+        // Build a hash leaf, measure its mean point-lookup work per key (leaf_cost), take the
+        // ordered leaf's mean work from mean_ordered_steps, and keep the cheaper form under the
+        // same (memory + query) weights the agents' reward uses. No window, no threshold constant.
+        // The query terms are averaged over the leaf's keys (uniform-over-keys), as elsewhere.
+        data_node_type *prebuilt_hash = nullptr;
         bool use_ordered;
-        if (leaf_window_threshold > 0) {
+        if (leaf_cost_decision > 0) {
+            prebuilt_hash = data_node_type::new_segment(
+                    std::max(int(float(data_count) / default_density), DATA_NODE_SIZE), lower, upper);
+            for (auto ii = begin; ii < end; ++ii) {
+                auto position = prebuilt_hash->find_insert(ii->first);
+                if (position < 0) { throw MyException("bulk load insertion bad position!"); }
+                prebuilt_hash->array[position].first = ii->first;
+                prebuilt_hash->array[position].second = ii->second;
+                set_bitmap(prebuilt_hash->bitmap_start(), position);
+                ++prebuilt_hash->size;
+            }
+            // Mean slots examined to find a key in the hash leaf: probe outward from the predicted
+            // slot, checking left then right. Counts every slot read, including the one holding the
+            // key, so it is the same unit as mean_ordered_steps (the prediction access plus each
+            // gallop/binary step). find_with_cost omits the successful access, which would make a
+            // collision-free hash leaf look free and wrongly win the comparison.
+            long long hash_accesses = 0;
+            const int hash_capacity = prebuilt_hash->capacity;
+            for (auto ii = begin; ii < end; ++ii) {
+                const key_T key = ii->first;
+                int left = prebuilt_hash->hash(key);
+                int right = left;
+                for (int i = 0; i <= prebuilt_hash->max_offset; ++i, --left, ++right) {
+                    if (left < 0) { left += hash_capacity; }
+                    if (right >= hash_capacity) { right -= hash_capacity; }
+                    ++hash_accesses;
+                    if (get_bitmap(prebuilt_hash->bitmap_start(), left) && prebuilt_hash->array[left].first == key) { break; }
+                    ++hash_accesses;
+                    if (get_bitmap(prebuilt_hash->bitmap_start(), right) && prebuilt_hash->array[right].first == key) { break; }
+                }
+            }
+            const double mu_h = double(hash_accesses) / double(std::max(1, data_count));
+            const double mu_o = mean_ordered_steps<key_T, value_T>(sorted_keys);
+            // memory per key, in slots: capacity / size (the slot size in bytes cancels out)
+            const double mem_o = double(std::max(data_count, DATA_NODE_SIZE)) / double(std::max(1, data_count));
+            const double mem_h = double(prebuilt_hash->capacity) / double(std::max(1, data_count));
+            const double cost_o = QUERY_WEIGHT * leaf_cost_weight * mu_o + MEMORY_WEIGHT * mem_o;
+            const double cost_h = QUERY_WEIGHT * leaf_cost_weight * mu_h + MEMORY_WEIGHT * mem_h;
+            use_ordered = (cost_o < cost_h) && (data_count > DATA_NODE_SIZE);
+        } else if (leaf_window_threshold > 0) {
             use_ordered = (window_p99 <= leaf_window_threshold) && (data_count > DATA_NODE_SIZE);
         } else {
             use_ordered = (adaptive_theta > 0) && (skew <= adaptive_theta) && (data_count > DATA_NODE_SIZE);
@@ -499,6 +594,7 @@ namespace Hits {
 #endif
 
         if (use_ordered) {
+            if (prebuilt_hash != nullptr) { data_node_type::delete_segment(prebuilt_hash); }
 #ifdef PILOT_DIAGNOSTICS
             ++ordered_leaf_count;
 #endif
@@ -514,6 +610,14 @@ namespace Hits {
             leaf_stats.push_back({data_count, 1, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
 #endif
             return node;
+        }
+        // LEAF_COST_DECISION measured and kept the hash leaf; reuse it instead of rebuilding
+        if (prebuilt_hash != nullptr) {
+#ifdef PILOT_DIAGNOSTICS
+            prebuilt_hash->leaf_id = int(leaf_stats.size());
+            leaf_stats.push_back({data_count, 0, skew, 0, 0, window_p99, window_max, interval_width, key_span, lower, upper});
+#endif
+            return prebuilt_hash;
         }
         auto node = data_node_type::new_segment(
                 std::max(int(float(data_count) / default_density), DATA_NODE_SIZE), lower, upper);
