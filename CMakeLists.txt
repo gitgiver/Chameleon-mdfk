@@ -87,6 +87,9 @@ add_executable(pilot_range benchmark/pilot_range.cpp)
 # Production path: same index, same agents, but built without PILOT_DIAGNOSTICS
 add_executable(prod_bench benchmark/prod_bench.cpp)
 
+# Range queries conditioned on the leaf type a range falls into (ordered vs hash), on a mixed index
+add_executable(leaf_range benchmark/leaf_range.cpp)
+
 # benchmark/test.cpp includes ../others/other_indexes.h. The b+tree/alex/pgm/lipp
 # baselines are not part of this repository, so this target cannot be built.
 # add_executable(test benchmark/test.cpp )
