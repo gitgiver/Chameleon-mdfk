@@ -69,6 +69,13 @@ static int leaf_cost_decision = []() -> int {
     const char *s = std::getenv("LEAF_COST_DECISION");
     return s ? std::atoi(s) : 0;
 }();
+// LEAF_RANGE_WEIGHT : weight of a range query relative to a point query, used only by the
+// ordered-vs-hash leaf decision below. 0 drops the range term (point + memory only, the default).
+// It is deliberately separate from QUERY_WEIGHT/MEMORY_WEIGHT, which the agents' reward also uses.
+static double leaf_range_weight = []() -> double {
+    const char *s = std::getenv("LEAF_RANGE_WEIGHT");
+    return s ? std::atof(s) : 0.0;
+}();
 //#define inner_cost_weight (float(6.01213))
 #define inner_cost_weight (float(60.01213))
 #define leaf_cost_weight (float(1.35074178))
@@ -565,9 +572,22 @@ namespace Hits {
             // memory per key, in slots: capacity / size (the slot size in bytes cancels out)
             const double mem_o = double(std::max(data_count, DATA_NODE_SIZE)) / double(std::max(1, data_count));
             const double mem_h = double(prebuilt_hash->capacity) / double(std::max(1, data_count));
-            const double cost_o = QUERY_WEIGHT * leaf_cost_weight * mu_o + MEMORY_WEIGHT * mem_o;
-            const double cost_h = QUERY_WEIGHT * leaf_cost_weight * mu_h + MEMORY_WEIGHT * mem_h;
+            // range-query locate cost, in slots scanned per query: the ordered leaf binary-searches
+            // to the lower bound; the hash leaf must scan every slot (its slots are not in key
+            // order). LEAF_RANGE_WEIGHT = 0 removes these terms.
+            const double range_o = std::log2(std::max(2.0, double(data_count)));
+            const double range_h = double(prebuilt_hash->capacity);
+            const double cost_o = QUERY_WEIGHT * leaf_cost_weight * mu_o
+                                  + leaf_range_weight * leaf_cost_weight * range_o
+                                  + MEMORY_WEIGHT * mem_o;
+            const double cost_h = QUERY_WEIGHT * leaf_cost_weight * mu_h
+                                  + leaf_range_weight * leaf_cost_weight * range_h
+                                  + MEMORY_WEIGHT * mem_h;
             use_ordered = (cost_o < cost_h) && (data_count > DATA_NODE_SIZE);
+            if (data_count > 1000000) {
+                fprintf(stderr, "COSTDEBUG size=%d mu_o=%.3f mu_h=%.3f mem_o=%.3f mem_h=%.3f cost_o=%.3f cost_h=%.3f ordered=%d\n",
+                        data_count, mu_o, mu_h, mem_o, mem_h, cost_o, cost_h, int(cost_o < cost_h));
+            }
         } else if (leaf_window_threshold > 0) {
             use_ordered = (window_p99 <= leaf_window_threshold) && (data_count > DATA_NODE_SIZE);
         } else {

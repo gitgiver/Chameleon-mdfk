@@ -178,9 +178,9 @@ int main() {
     std::ofstream result(father_path + "read_only/read_only_result.txt", std::ios::out | std::ios::binary);
     std::string dis_type;
     for (int dis = 1; dis < 2; dis++) {
-        for (int length: std::vector<float>({50e6,100e6,150e6,200e6})) {
+        for (int length: std::vector<float>({200e6})) {
             for (const auto &dataset_name: std::vector<std::string>(
-                    {"uden.data","face.data"})) {
+                    {"uden.data","face.data","osmc.data","logn.data"})) {
                 dataset = dataset_source::get_dataset<std::pair<KEY_TYPE, VALUE_TYPE>>(data_father_path + dataset_name);
                 if(dataset.size() > length){
                     dataset.resize(length);
