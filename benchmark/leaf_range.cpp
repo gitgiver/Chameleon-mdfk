@@ -342,24 +342,8 @@ int main() {
                100.0 * double(ordered_keys) / double(std::max(1LL, ordered_keys + hash_keys)), N);
         fflush(stdout);
 
-        auto run_group = [&](int want_ordered, const char *label) {
-            std::vector<size_t> zi;
-            std::vector<long long> cumpfx;
-            long long total = 0;
-            for (size_t z = 0; z < zones.size(); ++z) {
-                if (zones[z].ordered != want_ordered) { continue; }
-                long long len = zones[z].rank_hi - zones[z].rank_lo;
-                if (len > N) { zi.push_back(z); total += len - N; cumpfx.push_back(total); }
-            }
-            if (zi.empty()) { printf("  leafrange[%s]: no eligible zone\n", label); fflush(stdout); return; }
-            std::uniform_int_distribution<long long> pick(0, total - 1);
-            std::vector<long> starts(Q);
-            for (long q = 0; q < Q; ++q) {
-                long long t = pick(rng);
-                size_t k = std::lower_bound(cumpfx.begin(), cumpfx.end(), t + 1) - cumpfx.begin();
-                long long prev = (k == 0) ? 0 : cumpfx[k - 1];
-                starts[q] = (long) (zones[zi[k]].rank_lo + (t - prev));
-            }
+        // shared measurement over a fixed set of start ranks
+        auto measure = [&](std::vector<long> &starts, const char *label) {
             std::vector<std::pair<KEY_TYPE, VALUE_TYPE>> out;
             out.reserve(1 << 20);
             long errors = 0, verified = 0;
@@ -401,8 +385,50 @@ int main() {
                    label, Q, pass_total[best], pass_avg[best], double(emitted) / double(Q), verified, errors);
             fflush(stdout);
         };
-        run_group(1, "all-ordered");
-        run_group(0, "all-hash");
+
+        // a range entirely inside same-type leaves (ordered or hash)
+        auto run_zone_group = [&](int want_ordered, const char *label) {
+            std::vector<size_t> zi;
+            std::vector<long long> cumpfx;
+            long long total = 0;
+            for (size_t z = 0; z < zones.size(); ++z) {
+                if (zones[z].ordered != want_ordered) { continue; }
+                long long len = zones[z].rank_hi - zones[z].rank_lo;
+                if (len > N) { zi.push_back(z); total += len - N; cumpfx.push_back(total); }
+            }
+            if (zi.empty()) { printf("  leafrange[%s]: no eligible zone\n", label); fflush(stdout); return; }
+            std::uniform_int_distribution<long long> pick(0, total - 1);
+            std::vector<long> starts(Q);
+            for (long q = 0; q < Q; ++q) {
+                long long t = pick(rng);
+                size_t k = std::lower_bound(cumpfx.begin(), cumpfx.end(), t + 1) - cumpfx.begin();
+                long long prev = (k == 0) ? 0 : cumpfx[k - 1];
+                starts[q] = (long) (zones[zi[k]].rank_lo + (t - prev));
+            }
+            measure(starts, label);
+        };
+
+        // a range that straddles an ordered/hash boundary: ~N/2 keys on each side
+        auto run_half_half = [&](const char *label) {
+            const long long H = N / 2;
+            std::vector<long long> anchors;
+            for (size_t z = 0; z + 1 < zones.size(); ++z) {
+                if (zones[z].ordered == zones[z + 1].ordered) { continue; }
+                long long b = zones[z].rank_hi;// boundary rank: end of zone z, start of zone z+1
+                long long start = b - H;
+                long long end = start + N;
+                if (start >= zones[z].rank_lo && end < zones[z + 1].rank_hi) { anchors.push_back(start); }
+            }
+            if (anchors.empty()) { printf("  leafrange[%s]: no straddling boundary\n", label); fflush(stdout); return; }
+            std::uniform_int_distribution<size_t> pick(0, anchors.size() - 1);
+            std::vector<long> starts(Q);
+            for (long q = 0; q < Q; ++q) { starts[q] = (long) anchors[pick(rng)]; }
+            measure(starts, label);
+        };
+
+        run_zone_group(1, "all-ordered");
+        run_zone_group(0, "all-hash");
+        if (N >= 2) { run_half_half("half-half"); }
     }
 
     delete index;

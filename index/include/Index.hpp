@@ -815,7 +815,12 @@ namespace Hits {
     template<class key_T, class value_T>
     void range_collect_node(InnerNode<key_T, value_T> *node, key_T lo, key_T hi,
                             std::vector<std::pair<key_T, value_T>> &out) {
-        for (int i = 0; i < node->capacity; ++i) {
+        // Children are equal-width and key-ordered, so interpolation (the same forward() the point
+        // lookup uses) lands on the first child whose interval can reach lo; scanning children from
+        // index 0 would make the walk O(fanout) per level instead of O(1) + the touched children.
+        // One step back guards against a rounding off-by-one.
+        int first = std::max(0, node->forward(lo) - 1);
+        for (int i = first; i < node->capacity; ++i) {
             auto interval = node->sub_interval(i);
             if (interval.second <= lo) { continue; }//entirely below the range
             if (interval.first > hi) { break; }     //ordered children: nothing above can match
