@@ -420,6 +420,8 @@ int main() {
                 if (start >= zones[z].rank_lo && end < zones[z + 1].rank_hi) { anchors.push_back(start); }
             }
             if (anchors.empty()) { printf("  leafrange[%s]: no straddling boundary\n", label); fflush(stdout); return; }
+            printf("  half-half anchors=%zu first=%lld last=%lld\n", anchors.size(), anchors.front(), anchors.back());
+            fflush(stdout);
             std::uniform_int_distribution<size_t> pick(0, anchors.size() - 1);
             std::vector<long> starts(Q);
             for (long q = 0; q < Q; ++q) { starts[q] = (long) anchors[pick(rng)]; }
