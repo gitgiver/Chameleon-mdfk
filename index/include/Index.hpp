@@ -15,7 +15,12 @@
 
 #define DATA_NODE_SIZE 5
 const float min_density = 0.35;
-const float default_density = 0.65;
+// DEFAULT_DENSITY overrides the leaf hash load factor (size/capacity). A measurement hook for the
+// per-leaf memory-vs-probe sweep; unset -> the original constant.
+static float default_density = []() -> float {
+    const char *s = std::getenv("DEFAULT_DENSITY");
+    return s ? std::atof(s) : 0.65f;
+}();
 const float max_density = 0.95;
 
 
