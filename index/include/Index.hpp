@@ -81,6 +81,70 @@ static double leaf_range_weight = []() -> double {
     const char *s = std::getenv("LEAF_RANGE_WEIGHT");
     return s ? std::atof(s) : 0.0;
 }();
+// >>> WORKLOAD-AWARE LEAF DENSITY <<<
+// The index is built for a workload, not only for the data: the harness fills workload_model with
+// a key-space histogram of the query distribution BEFORE bulk_load, and each hash leaf's load
+// factor is set from that leaf's own query rate. A hot leaf (queried at or above the global
+// average per-key rate) keeps default_density; a cold leaf is packed to WORKLOAD_COLD_DENSITY.
+// Empty model -> every leaf keeps default_density, i.e. the baseline path, byte for byte.
+//   WORKLOAD_DENSITY > 0 : apply the decision
+//   unset                : only accumulate kappa/phi (the "count-only" measurement mode)
+struct WorkloadModel {
+    double lower = 0;   // key bounds of the histogram (the root interval)
+    double upper = 0;
+    int bins = 0;
+    double keys = 0;    // total keys in the dataset
+    double total = 0;   // total queries represented by hist
+    std::vector<double> hist;
+    bool active() const { return bins > 0 && !hist.empty(); }
+};
+static WorkloadModel workload_model;
+struct WorkloadStats {
+    long long leaves = 0, cold_leaves = 0;
+    long long all_keys = 0, cold_keys = 0;
+    double all_q = 0, cold_q = 0;
+};
+static WorkloadStats workload_stats;
+static double workload_cold_density = []() -> double {
+    const char *s = std::getenv("WORKLOAD_COLD_DENSITY");
+    return s ? std::atof(s) : 0.85;
+}();
+static int workload_apply = []() -> int {
+    const char *s = std::getenv("WORKLOAD_DENSITY");
+    return s ? std::atoi(s) : 0;
+}();
+
+// Sum the query histogram over a leaf's key interval [lower, upper] and return the load factor to
+// build that leaf at. Side effect: accumulates the kappa (cold key share) / phi (cold query share)
+// statistics that decide whether a workload-aware layout is worth anything at all.
+static double workload_leaf_density(int data_count, double lower, double upper) {
+    if (!workload_model.active()) { return default_density; }
+    const double span = workload_model.upper - workload_model.lower;
+    double q = 0;
+    if (span > 0) {
+        auto bin_of = [&](double key) {
+            double p = double(workload_model.bins) * (key - workload_model.lower) / span;
+            int b = int(p);
+            if (b < 0) { b = 0; }
+            if (b >= workload_model.bins) { b = workload_model.bins - 1; }
+            return b;
+        };
+        for (int b = bin_of(lower); b <= bin_of(upper); ++b) { q += workload_model.hist[b]; }
+    }
+    const double avg = (workload_model.keys > 0) ? workload_model.total / workload_model.keys : 0.0;
+    const double rate = (data_count > 0) ? q / double(data_count) : 0.0;
+    ++workload_stats.leaves;
+    workload_stats.all_keys += data_count;
+    workload_stats.all_q += q;
+    const bool cold = rate < avg;
+    if (cold) {
+        ++workload_stats.cold_leaves;
+        workload_stats.cold_keys += data_count;
+        workload_stats.cold_q += q;
+    }
+    if (!workload_apply) { return default_density; }
+    return cold ? workload_cold_density : default_density;
+}
 //#define inner_cost_weight (float(6.01213))
 #define inner_cost_weight (float(60.01213))
 #define leaf_cost_weight (float(1.35074178))
@@ -497,6 +561,10 @@ namespace Hits {
             double lower, double upper) {
         using data_node_type = DataNode<key_T, value_T>;
         auto data_count = int(end - begin);
+        // Workload-aware load factor: the harness filled workload_model with the query
+        // distribution's key histogram before bulk_load, so this leaf's query rate decides whether
+        // it is packed (cold) or left at default_density (hot). Empty model -> default_density.
+        const double leaf_density = workload_leaf_density(data_count, lower, upper);
 
         // Compute only what the active criterion needs. With every criterion off (the production
         // default) this function does exactly what the original leaf construction did: no copy,
@@ -645,7 +713,7 @@ namespace Hits {
             return prebuilt_hash;
         }
         auto node = data_node_type::new_segment(
-                std::max(int(float(data_count) / default_density), DATA_NODE_SIZE), lower, upper);
+                std::max(int(float(data_count) / leaf_density), DATA_NODE_SIZE), lower, upper);
         for (auto ii = begin; ii < end; ++ii) {
             auto position = node->find_insert(ii->first);
             if (position < 0) { throw MyException("bulk load insertion bad position!"); }

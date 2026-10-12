@@ -99,6 +99,52 @@ int main() {
         conf = controller.get_best_action_GA(exp_chosen).conf;
     }
 
+    // >>> workload model <<<
+    // A rank sampler that sends PROD_WORK_HOT_Q of the queries into a contiguous hot rank interval
+    // of width PROD_WORK_HOT_W (starting at PROD_WORK_HOT_POS), the rest uniform. The SAME sampler
+    // fills workload_model (histogrammed by key, before bulk_load) and drives the point-query phase,
+    // so the layout is built for exactly the workload it is measured on. hot_w <= 0 -> uniform, and
+    // workload_model stays empty -> every leaf keeps default_density.
+    const char *ww_env = std::getenv("PROD_WORK_HOT_W");
+    const double hot_w = ww_env ? std::atof(ww_env) : -1.0;
+    const double hot_q = std::getenv("PROD_WORK_HOT_Q") ? std::atof(std::getenv("PROD_WORK_HOT_Q")) : 0.8;
+    const double hot_pos = std::getenv("PROD_WORK_HOT_POS") ? std::atof(std::getenv("PROD_WORK_HOT_POS")) : 0.4;
+    auto skew_rank = [&](std::mt19937_64 &r) -> long {
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        if (u(r) < hot_q) {
+            long a = (long) (hot_pos * double(n));
+            long b = (long) ((hot_pos + hot_w) * double(n)) - 1;
+            if (b <= a) { b = a; }
+            std::uniform_int_distribution<long> d(a, b);
+            return d(r);
+        }
+        std::uniform_int_distribution<long> d(0, n - 1);
+        return d(r);
+    };
+    if (hot_w > 0) {
+        const int WB = BUCKET_SIZE;
+        std::vector<double> hist(WB, 0.0);
+        const long samples = 4000000;
+        std::mt19937_64 hrng(4242);
+        const double span = min_max.second - min_max.first;
+        for (long s = 0; s < samples; ++s) {
+            long r = skew_rank(hrng);
+            double p = double(WB) * (double(dataset[r].first) - min_max.first) / span;
+            int b = std::min(WB - 1, std::max(0, int(p)));
+            hist[b] += 1.0;
+        }
+        workload_model.lower = min_max.first;
+        workload_model.upper = min_max.second;
+        workload_model.bins = WB;
+        workload_model.keys = double(n);
+        workload_model.total = double(samples);
+        workload_model.hist = hist;
+        workload_stats = WorkloadStats();
+        printf("workload: model=on hot_w=%g hot_q=%g hot_pos=%g samples=%ld bins=%d apply=%d cold_density=%g\n",
+               hot_w, hot_q, hot_pos, samples, WB, workload_apply, workload_cold_density);
+        fflush(stdout);
+    }
+
     auto index = new Hits::Index<KEY_TYPE, VALUE_TYPE>(conf, min_max.first, min_max.second);
     auto t_build0 = std::chrono::high_resolution_clock::now();
     index->bulk_load(dataset.begin(), dataset.end());
@@ -117,6 +163,16 @@ int main() {
            double(leaf_sum_sq) / double(std::max(1LL, leaf_sum)),
            mem_bytes / (1024.0 * 1024.0), mem_ratio, build_ms);
 
+    if (workload_model.active()) {
+        const double kappa = double(workload_stats.cold_keys) / double(std::max(1LL, workload_stats.all_keys));
+        const double phi = (workload_stats.all_q > 0.0) ? workload_stats.cold_q / workload_stats.all_q : 0.0;
+        printf("workload[stats]: leaves=%lld cold_leaves=%lld (%.1f%%) kappa=%.4f phi=%.4f\n",
+               workload_stats.leaves, workload_stats.cold_leaves,
+               100.0 * double(workload_stats.cold_leaves) / double(std::max(1LL, workload_stats.leaves)),
+               kappa, phi);
+        fflush(stdout);
+    }
+
     std::mt19937_64 rng(1000);
 
     // ---- point queries ----
@@ -129,7 +185,7 @@ int main() {
         for (int rep = 0; rep < repeats; ++rep) {
             auto t0 = std::chrono::high_resolution_clock::now();
             for (long q = 0; q < per_pass; ++q) {
-                long id = dist(rng);
+                long id = (hot_w > 0) ? skew_rank(rng) : dist(rng);
                 if (!index->get(dataset[id].first, value) || value != dataset[id].second) { ++errors; }
             }
             auto t1 = std::chrono::high_resolution_clock::now();
