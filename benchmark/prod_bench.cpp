@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <x86intrin.h>
 #include <torch/torch.h>
 #include "../include/DEFINE.h"
 
@@ -53,6 +54,22 @@ static void census(Hits::InnerNode<key_T, value_T> *node, long long &leaves,
             ++leaves;
             sum += size;
             sum_sq += size * size;
+        }
+    }
+}
+
+// Leaves in key order with their key intervals and sizes. Children are equal-width and key-ordered,
+// so a depth-first walk emits the leaves ordered by key, and each leaf's interval is its parent slot's
+// sub_interval -- the very interval build_leaf_ saw. Used to label a query's leaf hot/cold.
+template<class key_T, class value_T>
+static void census_iv(Hits::InnerNode<key_T, value_T> *node,
+                      std::vector<std::pair<double, double>> &ivs, std::vector<long long> &sizes) {
+    for (int i = 0; i < node->capacity; ++i) {
+        if (get_bitmap(node->bitmap_start(), i)) {
+            census_iv<key_T, value_T>(node->array[i].inner_node, ivs, sizes);
+        } else {
+            ivs.push_back(node->sub_interval(i));
+            sizes.push_back(node->array[i].data_node->size);
         }
     }
 }
@@ -196,6 +213,84 @@ int main() {
         printf("  point: queries=%-9ld ns=%.2f (med %.2f max %.2f, %zu passes) errors=%ld\n",
                per_pass * (long) measured.size(), measured.front(),
                measured[measured.size() / 2], measured.back(), measured.size(), errors);
+        fflush(stdout);
+    }
+
+    // ---- point latency on ONE path: mixed stream, per-query rdtsc, binned by leaf class ----
+    // A single interleaved run. Each query is timed individually (rdtsc) and binned by whether its
+    // target leaf is hot or cold, so the reported total IS the (1-phi)*L_hot + phi*L_cold mixture by
+    // construction -- total, hot and cold all come from the same run and reconcile. (The wall-clock
+    // "point:" line above is a different path and is NOT comparable to these, as usual.) The rdtsc
+    // pair adds a constant per query, so the absolute levels sit a little above "point:". The class
+    // comes from the build-time leaf intervals (census) plus the very rule build_leaf_ used.
+    if (workload_model.active()) {
+        std::vector<std::pair<double, double>> ivs;
+        std::vector<long long> szs;
+        census_iv<KEY_TYPE, VALUE_TYPE>(index->root, ivs, szs);
+        std::vector<double> hi;
+        std::vector<char> cold;
+        long long cold_leaves = 0;
+        for (size_t i = 0; i < ivs.size(); ++i) {
+            hi.push_back(ivs[i].second);
+            char c = workload_leaf_is_cold(int(szs[i]), ivs[i].first, ivs[i].second) ? 1 : 0;
+            cold.push_back(c);
+            cold_leaves += c;
+        }
+        auto is_cold_key = [&](double key) -> bool {
+            if (hi.empty()) { return false; }
+            size_t i = size_t(std::lower_bound(hi.begin(), hi.end(), key) - hi.begin());
+            if (i >= cold.size()) { i = cold.size() - 1; }
+            return cold[i] != 0;
+        };
+        double ticks_per_ns = 1.0;
+        {
+            auto w0 = std::chrono::high_resolution_clock::now();
+            uint64_t c0 = __rdtsc();
+            volatile double acc = 0.0;
+            for (long k = 0; k < 20000000; ++k) { acc += double(k); }
+            uint64_t c1 = __rdtsc();
+            auto w1 = std::chrono::high_resolution_clock::now();
+            double ns = std::chrono::duration<double, std::nano>(w1 - w0).count();
+            if (ns > 0) { ticks_per_ns = double(c1 - c0) / ns; }
+            (void) acc;
+        }
+        std::mt19937_64 srng(1000);
+        std::uniform_int_distribution<long> sdist(0, n - 1);
+        const long sper = std::max<long>(1, n_queries / repeats);
+        VALUE_TYPE v;
+        long errors = 0, hot_total = 0, cold_total = 0;
+        std::vector<double> tpass, hpass, cpass;
+        for (int rep = 0; rep < repeats; ++rep) {
+            uint64_t hot_c = 0, cold_c = 0;
+            long hot_n = 0, cold_n = 0;
+            for (long q = 0; q < sper; ++q) {
+                long id = (hot_w > 0) ? skew_rank(srng) : sdist(srng);
+                bool c = is_cold_key(double(dataset[id].first));
+                uint64_t c0 = __rdtsc();
+                bool ok = index->get(dataset[id].first, v) && (v == dataset[id].second);
+                uint64_t c1 = __rdtsc();
+                if (!ok) { ++errors; }
+                if (c) { cold_c += c1 - c0; ++cold_n; } else { hot_c += c1 - c0; ++hot_n; }
+            }
+            hot_total += hot_n;
+            cold_total += cold_n;
+            if (hot_n + cold_n > 0) { tpass.push_back(double(hot_c + cold_c) / ticks_per_ns / double(hot_n + cold_n)); }
+            if (hot_n > 0) { hpass.push_back(double(hot_c) / ticks_per_ns / double(hot_n)); }
+            if (cold_n > 0) { cpass.push_back(double(cold_c) / ticks_per_ns / double(cold_n)); }
+        }
+        auto report = [](const char *tag, std::vector<double> &p) {
+            if (p.size() > 1) { p.erase(p.begin()); }// drop warm-up pass
+            if (p.empty()) { return; }
+            std::sort(p.begin(), p.end());
+            printf("  %s ns(min)=%.2f ns(med)=%.2f (n=%zu)\n", tag, p.front(), p[p.size() / 2], p.size());
+        };
+        printf("  byclass: leaves=%zu cold=%lld queries hot=%ld cold=%ld (%ld%%) errors=%ld ticks_per_ns=%.3f\n",
+               ivs.size(), cold_leaves, hot_total, cold_total,
+               (long) (100.0 * double(cold_total) / double(std::max(1L, hot_total + cold_total))),
+               errors, ticks_per_ns);
+        report("point-t  ", tpass);
+        report("hot-leaf ", hpass);
+        report("cold-leaf", cpass);
         fflush(stdout);
     }
 

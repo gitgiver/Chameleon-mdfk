@@ -114,29 +114,42 @@ static int workload_apply = []() -> int {
     return s ? std::atoi(s) : 0;
 }();
 
-// Sum the query histogram over a leaf's key interval [lower, upper] and return the load factor to
-// build that leaf at. Side effect: accumulates the kappa (cold key share) / phi (cold query share)
-// statistics that decide whether a workload-aware layout is worth anything at all.
+// Query mass in the histogram over a leaf's key interval [lower, upper].
+static double workload_leaf_q(double lower, double upper) {
+    if (!workload_model.active()) { return 0.0; }
+    const double span = workload_model.upper - workload_model.lower;
+    if (!(span > 0)) { return 0.0; }
+    auto bin_of = [&](double key) {
+        double p = double(workload_model.bins) * (key - workload_model.lower) / span;
+        int b = int(p);
+        if (b < 0) { b = 0; }
+        if (b >= workload_model.bins) { b = workload_model.bins - 1; }
+        return b;
+    };
+    double q = 0;
+    for (int b = bin_of(lower); b <= bin_of(upper); ++b) { q += workload_model.hist[b]; }
+    return q;
+}
+
+// True when a leaf with this key interval and size sits below the global mean per-key query rate.
+// build_leaf_ uses it to call a leaf cold; the harness uses it to label queries the same way, so a
+// query's class always matches the class the layout was built with.
+static bool workload_leaf_is_cold(int data_count, double lower, double upper) {
+    if (!workload_model.active() || workload_model.keys <= 0) { return false; }
+    const double avg = workload_model.total / workload_model.keys;
+    const double rate = (data_count > 0) ? workload_leaf_q(lower, upper) / double(data_count) : 0.0;
+    return rate < avg;
+}
+
+// Load factor to build a leaf at. Side effect: accumulates the kappa (cold key share) / phi (cold
+// query share) statistics that decide whether a workload-aware layout is worth anything at all.
 static double workload_leaf_density(int data_count, double lower, double upper) {
     if (!workload_model.active()) { return default_density; }
-    const double span = workload_model.upper - workload_model.lower;
-    double q = 0;
-    if (span > 0) {
-        auto bin_of = [&](double key) {
-            double p = double(workload_model.bins) * (key - workload_model.lower) / span;
-            int b = int(p);
-            if (b < 0) { b = 0; }
-            if (b >= workload_model.bins) { b = workload_model.bins - 1; }
-            return b;
-        };
-        for (int b = bin_of(lower); b <= bin_of(upper); ++b) { q += workload_model.hist[b]; }
-    }
-    const double avg = (workload_model.keys > 0) ? workload_model.total / workload_model.keys : 0.0;
-    const double rate = (data_count > 0) ? q / double(data_count) : 0.0;
+    const double q = workload_leaf_q(lower, upper);
+    const bool cold = workload_leaf_is_cold(data_count, lower, upper);
     ++workload_stats.leaves;
     workload_stats.all_keys += data_count;
     workload_stats.all_q += q;
-    const bool cold = rate < avg;
     if (cold) {
         ++workload_stats.cold_leaves;
         workload_stats.cold_keys += data_count;
