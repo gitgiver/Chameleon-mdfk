@@ -117,18 +117,56 @@ int main() {
     }
 
     // >>> workload model <<<
-    // A rank sampler that sends PROD_WORK_HOT_Q of the queries into a contiguous hot rank interval
-    // of width PROD_WORK_HOT_W (starting at PROD_WORK_HOT_POS), the rest uniform. The SAME sampler
-    // fills workload_model (histogrammed by key, before bulk_load) and drives the point-query phase,
-    // so the layout is built for exactly the workload it is measured on. hot_w <= 0 -> uniform, and
-    // workload_model stays empty -> every leaf keeps default_density.
+    // Two synthetic workloads, both defined on the RANK axis (rank order = key order, so a rank
+    // interval is a contiguous key region and FACE's clustered keys are handled cleanly):
+    //   PROD_WORK_ZIPF_S = s >= 0 : Zipf(s) over ranks, P(rank) ~ (rank+1)^-s   (s = 0 -> uniform)
+    //   PROD_WORK_HOT_W  = w >  0 : a hot rank block of width w taking PROD_WORK_HOT_Q of the queries
+    // Both are sampled by the same routine, which fills workload_model (histogrammed by key, before
+    // bulk_load) and drives the point-query phase, so the layout is built for exactly the workload it
+    // is measured on. With neither set the model stays empty -> every leaf keeps default_density.
+    const char *zs_env = std::getenv("PROD_WORK_ZIPF_S");
+    const double zipf_s = zs_env ? std::atof(zs_env) : -1.0;
     const char *ww_env = std::getenv("PROD_WORK_HOT_W");
     const double hot_w = ww_env ? std::atof(ww_env) : -1.0;
     const double hot_q = std::getenv("PROD_WORK_HOT_Q") ? std::atof(std::getenv("PROD_WORK_HOT_Q")) : 0.8;
     const double hot_pos = std::getenv("PROD_WORK_HOT_POS") ? std::atof(std::getenv("PROD_WORK_HOT_POS")) : 0.4;
+    const bool use_zipf = (zipf_s >= 0.0);
+    const bool use_block = (!use_zipf && hot_w > 0);
+    const bool model_on = use_zipf || use_block;
+
+    // Zipf CDF over the rank axis: a bin's mass is the analytic integral of (r+1)^-s, so the head is
+    // resolved exactly and no per-key summation is needed.
+    const int ZG = 1 << 20;
+    std::vector<double> zipf_cdf;
+    if (use_zipf) {
+        zipf_cdf.assign(ZG + 1, 0.0);
+        double acc = 0.0;
+        for (int i = 1; i <= ZG; ++i) {
+            double a = double((long) (double(n) * double(i - 1) / double(ZG)) + 1);
+            double b = double((long) (double(n) * double(i) / double(ZG)) + 1);
+            acc += (std::abs(zipf_s - 1.0) < 1e-9)
+                   ? std::log(b / a)
+                   : (std::pow(b, 1.0 - zipf_s) - std::pow(a, 1.0 - zipf_s)) / (1.0 - zipf_s);
+            zipf_cdf[i] = acc;
+        }
+        for (double &v: zipf_cdf) { v /= acc; }
+    }
     auto skew_rank = [&](std::mt19937_64 &r) -> long {
         std::uniform_real_distribution<double> u(0.0, 1.0);
-        if (u(r) < hot_q) {
+        if (use_zipf) {
+            double x = u(r);
+            int i = int(std::lower_bound(zipf_cdf.begin(), zipf_cdf.end(), x) - zipf_cdf.begin());
+            if (i < 1) { i = 1; }
+            if (i > ZG) { i = ZG; }
+            long lo = (long) (double(n) * double(i - 1) / double(ZG));
+            long hi = (long) (double(n) * double(i) / double(ZG)) - 1;
+            if (lo < 0) { lo = 0; }
+            if (hi < lo) { hi = lo; }
+            if (hi > n - 1) { hi = n - 1; }
+            std::uniform_int_distribution<long> d(lo, hi);
+            return d(r);
+        }
+        if (use_block && u(r) < hot_q) {
             long a = (long) (hot_pos * double(n));
             long b = (long) ((hot_pos + hot_w) * double(n)) - 1;
             if (b <= a) { b = a; }
@@ -138,13 +176,13 @@ int main() {
         std::uniform_int_distribution<long> d(0, n - 1);
         return d(r);
     };
-    if (hot_w > 0) {
+    if (model_on) {
         const int WB = BUCKET_SIZE;
         std::vector<double> hist(WB, 0.0);
         const long samples = 4000000;
         std::mt19937_64 hrng(4242);
         const double span = min_max.second - min_max.first;
-        for (long s = 0; s < samples; ++s) {
+        for (long k = 0; k < samples; ++k) {
             long r = skew_rank(hrng);
             double p = double(WB) * (double(dataset[r].first) - min_max.first) / span;
             int b = std::min(WB - 1, std::max(0, int(p)));
@@ -157,8 +195,13 @@ int main() {
         workload_model.total = double(samples);
         workload_model.hist = hist;
         workload_stats = WorkloadStats();
-        printf("workload: model=on hot_w=%g hot_q=%g hot_pos=%g samples=%ld bins=%d apply=%d cold_density=%g\n",
-               hot_w, hot_q, hot_pos, samples, WB, workload_apply, workload_cold_density);
+        if (use_zipf) {
+            printf("workload: model=zipf s=%g samples=%ld bins=%d apply=%d cold_density=%g\n",
+                   zipf_s, samples, WB, workload_apply, workload_cold_density);
+        } else {
+            printf("workload: model=block hot_w=%g hot_q=%g hot_pos=%g samples=%ld bins=%d apply=%d cold_density=%g\n",
+                   hot_w, hot_q, hot_pos, samples, WB, workload_apply, workload_cold_density);
+        }
         fflush(stdout);
     }
 
@@ -198,11 +241,15 @@ int main() {
         const long per_pass = std::max<long>(1, n_queries / repeats);
         VALUE_TYPE value;
         long errors = 0;
+        std::vector<long> ids(per_pass);
         std::vector<double> pass_ns;
         for (int rep = 0; rep < repeats; ++rep) {
+            // Draw the queries OUTSIDE the timed region: "point:" must be the index lookup alone, not
+            // the cost of generating a query -- which for Zipf is a binary search over a 1M-entry CDF
+            // and would otherwise dominate (and vary with s).
+            for (long q = 0; q < per_pass; ++q) { ids[q] = model_on ? skew_rank(rng) : dist(rng); }
             auto t0 = std::chrono::high_resolution_clock::now();
-            for (long q = 0; q < per_pass; ++q) {
-                long id = (hot_w > 0) ? skew_rank(rng) : dist(rng);
+            for (long id: ids) {
                 if (!index->get(dataset[id].first, value) || value != dataset[id].second) { ++errors; }
             }
             auto t1 = std::chrono::high_resolution_clock::now();
@@ -264,7 +311,7 @@ int main() {
             uint64_t hot_c = 0, cold_c = 0;
             long hot_n = 0, cold_n = 0;
             for (long q = 0; q < sper; ++q) {
-                long id = (hot_w > 0) ? skew_rank(srng) : sdist(srng);
+                long id = model_on ? skew_rank(srng) : sdist(srng);
                 bool c = is_cold_key(double(dataset[id].first));
                 uint64_t c0 = __rdtsc();
                 bool ok = index->get(dataset[id].first, v) && (v == dataset[id].second);
