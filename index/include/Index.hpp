@@ -113,6 +113,13 @@ static int workload_apply = []() -> int {
     const char *s = std::getenv("WORKLOAD_DENSITY");
     return s ? std::atoi(s) : 0;
 }();
+// RUNTIME_ADAPTIVE > 0 : hash leaves count their accesses and the index can rebalance leaf densities
+// from live traffic (no build-time workload model needed). Off by default, so the build-time path is
+// unchanged. The counters are only read/written by the harness via Index::rebalance_leaves().
+static int runtime_adaptive = []() -> int {
+    const char *s = std::getenv("RUNTIME_ADAPTIVE");
+    return s ? std::atoi(s) : 0;
+}();
 
 // Query mass in the histogram over a leaf's key interval [lower, upper].
 static double workload_leaf_q(double lower, double upper) {
@@ -332,6 +339,7 @@ namespace Hits {
         int size{};
         int max_offset{};
         int ordered{};//1 -> dense key-sorted leaf (pilot); 0 -> original hash leaf
+        unsigned int hits{};//runtime adaptation: accesses to this leaf since the last check
 #ifdef PILOT_DIAGNOSTICS
         int leaf_id{-1};//index into Hits::leaf_stats, for diagnostics
 #endif
@@ -354,6 +362,7 @@ namespace Hits {
             node->size = 0;
             node->max_offset = 0;
             node->ordered = 0;
+            node->hits = 0;
 #ifdef PILOT_DIAGNOSTICS
             node->leaf_id = -1;
 #endif
@@ -1264,6 +1273,7 @@ namespace Hits {
                 position = node->forward(key);
             }
             auto data_node = node->array[position].data_node;
+            if (runtime_adaptive) { ++data_node->hits; }
             auto data_position = data_node->find(key);
             if (data_position < 0 || data_node->array[data_position].first != key) {//offset == max_offset
 #ifdef CB
@@ -1277,6 +1287,69 @@ namespace Hits {
 #endif
                 return true;
             }
+        }
+
+        // ---- runtime adaptation (RUNTIME_ADAPTIVE) ----
+        void collect_leaves_(InnerNode<key_T, value_T> *node,
+                             std::vector<DataNode<key_T, value_T> *> &leaves,
+                             std::vector<InnerNode<key_T, value_T> *> &parents,
+                             std::vector<int> &slots) {
+            for (int i = 0; i < node->capacity; ++i) {
+                if (get_bitmap(node->bitmap_start(), i)) {
+                    collect_leaves_(node->array[i].inner_node, leaves, parents, slots);
+                } else {
+                    leaves.push_back(node->array[i].data_node);
+                    parents.push_back(node);
+                    slots.push_back(i);
+                }
+            }
+        }
+
+        // Re-decide every hash leaf's density from its observed access count, with no build-time
+        // workload model. A leaf whose per-key rate has crossed the global mean (with a +-10%
+        // hysteresis band) is rebuilt at the other density. Counters are halved first so the
+        // statistics track recent traffic rather than all history. Single-threaded: no locking.
+        // Returns the number of leaves rebuilt.
+        long long rebalance_leaves() {
+            if (!runtime_adaptive || root == nullptr) { return 0; }
+            std::vector<DataNode<key_T, value_T> *> leaves;
+            std::vector<InnerNode<key_T, value_T> *> parents;
+            std::vector<int> slots;
+            collect_leaves_(root, leaves, parents, slots);
+            for (auto *l: leaves) { l->hits >>= 1; }
+            double total_hits = 0, total_keys = 0;
+            for (auto *l: leaves) { total_hits += double(l->hits); total_keys += double(l->size); }
+            if (!(total_hits > 0) || !(total_keys > 0)) { return 0; }
+            const double avg = total_hits / total_keys;
+            long long flipped = 0;
+            for (size_t k = 0; k < leaves.size(); ++k) {
+                auto *l = leaves[k];
+                if (l->ordered || l->size <= 0) { continue; }// hash leaves only
+                const int cap_hot = std::max(int(float(l->size) / default_density), DATA_NODE_SIZE);
+                const int cap_cold = std::max(int(float(l->size) / workload_cold_density), DATA_NODE_SIZE);
+                if (cap_cold == cap_hot) { continue; }// too small for the two densities to differ
+                const bool is_cold = (l->capacity == cap_cold);
+                const double rate = double(l->hits) / double(l->size);
+                bool want_cold = is_cold;
+                if (!is_cold && rate < 0.9 * avg) { want_cold = true; }
+                else if (is_cold && rate > 1.1 * avg) { want_cold = false; }
+                if (want_cold == is_cold) { continue; }
+                auto *nn = DataNode<key_T, value_T>::new_segment(want_cold ? cap_cold : cap_hot,
+                                                                 l->lower, l->upper);
+                for (int i = 0; i < l->capacity; ++i) {
+                    if (get_bitmap(l->bitmap_start(), i)) {
+                        auto p = nn->find_insert(l->array[i].first);
+                        if (p < 0) { throw MyException("rebalance insertion bad position!"); }
+                        nn->array[p] = l->array[i];
+                        set_bitmap(nn->bitmap_start(), p);
+                        ++nn->size;
+                    }
+                }
+                parents[k]->array[slots[k]].data_node = nn;
+                DataNode<key_T, value_T>::delete_segment(l);
+                ++flipped;
+            }
+            return flipped;
         }
 
 //        void range_query_(InnerNode<key_T,value_T> *node,std::vector<std::pair<key_T,value_T>> &result,double upper_bound){

@@ -74,6 +74,23 @@ static void census_iv(Hits::InnerNode<key_T, value_T> *node,
     }
 }
 
+// Same, plus each leaf's capacity, so a leaf's CURRENT density (and hence hot/cold class) can be
+// inferred after a runtime rebalance, not just from a build-time workload model.
+template<class key_T, class value_T>
+static void census_iv_cap(Hits::InnerNode<key_T, value_T> *node,
+                          std::vector<std::pair<double, double>> &ivs, std::vector<long long> &sizes,
+                          std::vector<int> &caps) {
+    for (int i = 0; i < node->capacity; ++i) {
+        if (get_bitmap(node->bitmap_start(), i)) {
+            census_iv_cap<key_T, value_T>(node->array[i].inner_node, ivs, sizes, caps);
+        } else {
+            ivs.push_back(node->sub_interval(i));
+            sizes.push_back(node->array[i].data_node->size);
+            caps.push_back(node->array[i].data_node->capacity);
+        }
+    }
+}
+
 int main() {
     controller.load_in();
     e.seed(12345);// the policy must be reproducible across configurations
@@ -125,7 +142,7 @@ int main() {
     // bulk_load) and drives the point-query phase, so the layout is built for exactly the workload it
     // is measured on. With neither set the model stays empty -> every leaf keeps default_density.
     const char *zs_env = std::getenv("PROD_WORK_ZIPF_S");
-    const double zipf_s = zs_env ? std::atof(zs_env) : -1.0;
+    double zipf_s = zs_env ? std::atof(zs_env) : -1.0;
     const char *ww_env = std::getenv("PROD_WORK_HOT_W");
     const double hot_w = ww_env ? std::atof(ww_env) : -1.0;
     const double hot_q = std::getenv("PROD_WORK_HOT_Q") ? std::atof(std::getenv("PROD_WORK_HOT_Q")) : 0.8;
@@ -133,24 +150,33 @@ int main() {
     const bool use_zipf = (zipf_s >= 0.0);
     const bool use_block = (!use_zipf && hot_w > 0);
     const bool model_on = use_zipf || use_block;
+    // RUNTIME_ADAPTIVE: queries are still skewed, but the build-time model is NOT filled, so the index
+    // starts all-hot and must discover the cold leaves from live traffic via rebalance_leaves().
+    const bool fill_model = model_on && !runtime_adaptive;
 
     // Zipf CDF over the rank axis: a bin's mass is the analytic integral of (r+1)^-s, so the head is
-    // resolved exactly and no per-key summation is needed.
+    // resolved exactly and no per-key summation is needed. Rebuildable so the drift experiment can
+    // change s between phases of a single run.
     const int ZG = 1 << 20;
     std::vector<double> zipf_cdf;
-    if (use_zipf) {
+    auto build_zipf_cdf = [&](double s) {
         zipf_cdf.assign(ZG + 1, 0.0);
         double acc = 0.0;
         for (int i = 1; i <= ZG; ++i) {
             double a = double((long) (double(n) * double(i - 1) / double(ZG)) + 1);
             double b = double((long) (double(n) * double(i) / double(ZG)) + 1);
-            acc += (std::abs(zipf_s - 1.0) < 1e-9)
+            acc += (std::abs(s - 1.0) < 1e-9)
                    ? std::log(b / a)
-                   : (std::pow(b, 1.0 - zipf_s) - std::pow(a, 1.0 - zipf_s)) / (1.0 - zipf_s);
+                   : (std::pow(b, 1.0 - s) - std::pow(a, 1.0 - s)) / (1.0 - s);
             zipf_cdf[i] = acc;
         }
         for (double &v: zipf_cdf) { v /= acc; }
-    }
+    };
+    if (use_zipf) { build_zipf_cdf(zipf_s); }
+    // Hot-region migration for the drift experiment: shifts where the Zipf head sits on the rank
+    // axis (circularly), so the hot region can MOVE between phases without changing the skew. The
+    // index is never told -- it only sees the queries.
+    long work_offset = 0;
     auto skew_rank = [&](std::mt19937_64 &r) -> long {
         std::uniform_real_distribution<double> u(0.0, 1.0);
         if (use_zipf) {
@@ -164,7 +190,7 @@ int main() {
             if (hi < lo) { hi = lo; }
             if (hi > n - 1) { hi = n - 1; }
             std::uniform_int_distribution<long> d(lo, hi);
-            return d(r);
+            return (d(r) + work_offset) % n;// shift the hot region along the rank axis
         }
         if (use_block && u(r) < hot_q) {
             long a = (long) (hot_pos * double(n));
@@ -176,7 +202,7 @@ int main() {
         std::uniform_int_distribution<long> d(0, n - 1);
         return d(r);
     };
-    if (model_on) {
+    if (fill_model) {
         const int WB = BUCKET_SIZE;
         std::vector<double> hist(WB, 0.0);
         const long samples = 4000000;
@@ -233,6 +259,118 @@ int main() {
         fflush(stdout);
     }
 
+    // ---- multi-phase drift experiment ----
+    // One index, one run. PROD_WORK_PHASES is a comma-separated list of Zipf exponents; the query
+    // stream changes s per phase and (when RUNTIME_ADAPTIVE is on) the index rebalances between
+    // phases. Static runs leave the build-time layout untouched.
+    const char *phases_env = std::getenv("PROD_WORK_PHASES");
+    if (phases_env != nullptr) {
+        std::vector<double> s_list;
+        for (const char *p = phases_env; ; ) {
+            s_list.push_back(std::atof(p));
+            const char *c = std::strchr(p, ',');
+            if (c == nullptr) { break; }
+            p = c + 1;
+        }
+        std::vector<double> off_list;// per-phase hot-region offset, as a fraction of n
+        if (const char *oe = std::getenv("PROD_WORK_OFFSETS")) {
+            for (const char *p = oe; ; ) {
+                off_list.push_back(std::atof(p));
+                const char *c = std::strchr(p, ',');
+                if (c == nullptr) { break; }
+                p = c + 1;
+            }
+        }
+        const long pq = std::getenv("PROD_PHASE_QUERIES")
+                        ? std::atol(std::getenv("PROD_PHASE_QUERIES")) : 2000000L;
+        // rebalance cadence: a segment of segq queries, then one rebalance. A phase is only a
+        // workload change point; the adaptation no longer waits for a phase boundary.
+        const long segq = std::getenv("PROD_REBALANCE_N")
+                          ? std::atol(std::getenv("PROD_REBALANCE_N")) : 500000L;
+        printf("drift: phases=%zu queries/phase=%ld seg=%ld adaptive=%d\n",
+               s_list.size(), pq, segq, runtime_adaptive);
+        fflush(stdout);
+        // rdtsc -> ns
+        double ticks_per_ns = 1.0;
+        {
+            auto w0 = std::chrono::high_resolution_clock::now();
+            uint64_t c0 = __rdtsc();
+            volatile double acc = 0.0;
+            for (long k = 0; k < 20000000; ++k) { acc += double(k); }
+            uint64_t c1 = __rdtsc();
+            auto w1 = std::chrono::high_resolution_clock::now();
+            double wns = std::chrono::duration<double, std::nano>(w1 - w0).count();
+            if (wns > 0) { ticks_per_ns = double(c1 - c0) / wns; }
+            (void) acc;
+        }
+        std::mt19937_64 prng(1000);
+        VALUE_TYPE pv;
+        long perr = 0;
+        const double denom = double(n) * sizeof(std::pair<KEY_TYPE, VALUE_TYPE>);
+        for (size_t p = 0; p < s_list.size(); ++p) {
+            // a phase is just a workload change point: skew and hot-region position change here
+            work_offset = (p < off_list.size()) ? (long) (off_list[p] * double(n)) : 0;
+            zipf_s = s_list[p];
+            build_zipf_cdf(zipf_s);
+            printf("== phase %zu: s=%.2f off=%.3f ==\n", p, s_list[p], double(work_offset) / double(n));
+            fflush(stdout);
+            for (long q0 = 0; q0 < pq; q0 += segq) {
+                const long q1 = std::min<long>(pq, q0 + segq);
+                std::vector<long> pids(q1 - q0);
+                for (long q = q0; q < q1; ++q) { pids[q - q0] = skew_rank(prng); }// OUTSIDE the timer
+                // classify leaves by their CURRENT density, so a runtime-compressed leaf counts as cold
+                std::vector<std::pair<double, double>> ivs;
+                std::vector<long long> szs;
+                std::vector<int> caps;
+                census_iv_cap<KEY_TYPE, VALUE_TYPE>(index->root, ivs, szs, caps);
+                std::vector<double> hi;
+                std::vector<char> cold_lf;
+                for (size_t i = 0; i < ivs.size(); ++i) {
+                    hi.push_back(ivs[i].second);
+                    int ch = std::max(int(float(szs[i]) / default_density), DATA_NODE_SIZE);
+                    int cc = std::max(int(float(szs[i]) / workload_cold_density), DATA_NODE_SIZE);
+                    cold_lf.push_back((cc != ch && caps[i] == cc) ? 1 : 0);
+                }
+                auto is_cold_key = [&](double key) -> bool {
+                    if (hi.empty()) { return false; }
+                    size_t i = size_t(std::lower_bound(hi.begin(), hi.end(), key) - hi.begin());
+                    if (i >= cold_lf.size()) { i = cold_lf.size() - 1; }
+                    return cold_lf[i] != 0;
+                };
+                const double mem0 = index->memory_occupied() / denom;
+                auto tw0 = std::chrono::high_resolution_clock::now();
+                for (long id: pids) {
+                    if (!index->get(dataset[id].first, pv) || pv != dataset[id].second) { ++perr; }
+                }
+                auto tw1 = std::chrono::high_resolution_clock::now();
+                const double point_ns =
+                        std::chrono::duration<double, std::nano>(tw1 - tw0).count() / double(pids.size());
+                uint64_t hot_c = 0, cold_c = 0;
+                long hot_n = 0, cold_n = 0;
+                for (long id: pids) {
+                    bool lc = is_cold_key(double(dataset[id].first));
+                    uint64_t c0 = __rdtsc();
+                    bool ok = index->get(dataset[id].first, pv) && (pv == dataset[id].second);
+                    uint64_t c1 = __rdtsc();
+                    if (!ok) { ++perr; }
+                    if (lc) { cold_c += c1 - c0; ++cold_n; } else { hot_c += c1 - c0; ++hot_n; }
+                }
+                const long tot_n = hot_n + cold_n;
+                const double l_hot = hot_n ? double(hot_c) / ticks_per_ns / double(hot_n) : 0.0;
+                const double l_cold = cold_n ? double(cold_c) / ticks_per_ns / double(cold_n) : 0.0;
+                const double l_w = tot_n ? double(hot_c + cold_c) / ticks_per_ns / double(tot_n) : 0.0;
+                long long flipped = 0;
+                if (runtime_adaptive) { flipped = index->rebalance_leaves(); }
+                const double mem1 = index->memory_occupied() / denom;
+                printf("  seg %zu.%ld: point=%.1f nh=%ld nc=%ld l_hot=%.1f l_cold=%.1f L=%.1f "
+                       "mem=%.4f->%.4f flipped=%lld err=%ld\n",
+                       p, q0 / segq, point_ns, hot_n, cold_n, l_hot, l_cold, l_w, mem0, mem1, flipped, perr);
+                fflush(stdout);
+            }
+        }
+        return 0;
+    }
+
     std::mt19937_64 rng(1000);
 
     // ---- point queries ----
@@ -254,6 +392,13 @@ int main() {
             }
             auto t1 = std::chrono::high_resolution_clock::now();
             pass_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / double(per_pass));
+            if (runtime_adaptive) {
+                // between passes: re-decide leaf densities from the traffic just observed
+                long long f = index->rebalance_leaves();
+                printf("  rebalance: pass=%d flipped=%lld mem_ratio=%.4f\n", rep, f,
+                       index->memory_occupied() / (double(n) * sizeof(std::pair<KEY_TYPE, VALUE_TYPE>)));
+                fflush(stdout);
+            }
         }
         std::vector<double> measured(pass_ns.begin() + 1, pass_ns.end());
         std::sort(measured.begin(), measured.end());
