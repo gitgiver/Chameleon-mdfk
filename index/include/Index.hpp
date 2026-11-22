@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include "Configuration.hpp"
 #include "RL_network.hpp"
 
@@ -239,18 +240,22 @@ inline void leaf_prediction_error(
     max_window = double(*std::max_element(errors.begin(), errors.end()));
 }
 
-// Mean point-lookup step count of the ordered (dense sorted) leaf, averaged over its keys: the
-// prediction access, then the gallop and binary search of find_ordered. Mirrors find_ordered so the
-// number is the work a lookup actually pays. Used by the two-sided leaf decision (build_leaf_).
+// Mean point-lookup latency of the ordered (dense sorted) leaf, in NANOSECONDS, averaged over its
+// keys. EXPERIMENTAL -- this MEASURES find_ordered's gallop+binary traversal (timed) instead of
+// counting its steps, so cache behaviour, which a step count cannot see, is captured. Keep it in
+// sync with find_ordered. Visit order is the leaf's key order (sorted).
 template<class key_T, class value_T>
-inline double mean_ordered_steps(const std::vector<std::pair<key_T, value_T>> &keys) {
+inline double mean_ordered_ns(const std::vector<std::pair<key_T, value_T>> &keys,
+                              const std::vector<int> &visit) {
     const int n = int(keys.size());
-    if (n <= 1) { return 1.0; }
+    if (n <= 1) { return 0.0; }
     const double kmin = double(keys.front().first);
     const double kmax = double(keys.back().first);
-    if (!(kmax > kmin)) { return 1.0; }//degenerate: all keys identical
-    long long total = 0;
-    for (int i = 0; i < n; ++i) {
+    if (!(kmax > kmin)) { return 0.0; }//degenerate: all keys identical
+    long long total = 0;//kept so the traversal below cannot be optimised away
+    auto t0 = std::chrono::steady_clock::now();
+    for (int j = 0; j < n; ++j) {
+        const int i = visit[j];//shuffled visit: a random point workload, not sorted order
         const double key = double(keys[i].first);
         int p = int(double(n - 1) * (key - kmin) / (kmax - kmin));
         if (p < 0) { p = 0; }
@@ -280,7 +285,9 @@ inline double mean_ordered_steps(const std::vector<std::pair<key_T, value_T>> &k
         }
         total += steps;
     }
-    return double(total) / double(n);
+    auto t1 = std::chrono::steady_clock::now();
+    volatile long long sink = total; (void) sink;//force the traversal to actually run
+    return std::chrono::duration<double, std::nano>(t1 - t0).count() / double(n);
 }
 
 namespace Hits {
@@ -642,15 +649,22 @@ namespace Hits {
                 set_bitmap(prebuilt_hash->bitmap_start(), position);
                 ++prebuilt_hash->size;
             }
-            // Mean slots examined to find a key in the hash leaf: probe outward from the predicted
-            // slot, checking left then right. Counts every slot read, including the one holding the
-            // key, so it is the same unit as mean_ordered_steps (the prediction access plus each
-            // gallop/binary step). find_with_cost omits the successful access, which would make a
-            // collision-free hash leaf look free and wrongly win the comparison.
-            long long hash_accesses = 0;
+            // EXPERIMENTAL -- this region is under active iteration. MEASURE both candidates' real
+            // point-lookup latency instead of estimating it from a slot count: a slot count cannot
+            // tell a scattered hash probe from a jumping ordered gallop, and that cache behaviour is
+            // what sets the real latency. The two traversals are the ones the old model counted;
+            // here they are wrapped in a timer. Visit order is the leaf's key order (sorted).
+            // shuffled visit order so the timing reflects a random point workload; visiting in
+            // sorted order would unfairly favour the ordered scan's contiguous accesses
+            std::vector<int> visit(data_count);
+            for (int i = 0; i < data_count; ++i) { visit[i] = i; }
+            std::shuffle(visit.begin(), visit.end(), e);
+
+            long long hash_accesses = 0;//kept so the probe loop cannot be optimised away
             const int hash_capacity = prebuilt_hash->capacity;
-            for (auto ii = begin; ii < end; ++ii) {
-                const key_T key = ii->first;
+            auto h0 = std::chrono::steady_clock::now();
+            for (int j = 0; j < data_count; ++j) {
+                const key_T key = (begin + visit[j])->first;
                 int left = prebuilt_hash->hash(key);
                 int right = left;
                 for (int i = 0; i <= prebuilt_hash->max_offset; ++i, --left, ++right) {
@@ -662,8 +676,12 @@ namespace Hits {
                     if (get_bitmap(prebuilt_hash->bitmap_start(), right) && prebuilt_hash->array[right].first == key) { break; }
                 }
             }
-            const double mu_h = double(hash_accesses) / double(std::max(1, data_count));
-            const double mu_o = mean_ordered_steps<key_T, value_T>(sorted_keys);
+            auto h1 = std::chrono::steady_clock::now();
+            volatile long long hsink = hash_accesses; (void) hsink;//force the probe loop to run
+            // mean nanoseconds per point lookup, measured for each candidate
+            const double mu_h = std::chrono::duration<double, std::nano>(h1 - h0).count()
+                                / double(std::max(1, data_count));
+            const double mu_o = mean_ordered_ns<key_T, value_T>(sorted_keys, visit);
             // memory per key, in slots: capacity / size (the slot size in bytes cancels out)
             const double mem_o = double(std::max(data_count, DATA_NODE_SIZE)) / double(std::max(1, data_count));
             const double mem_h = double(prebuilt_hash->capacity) / double(std::max(1, data_count));
@@ -672,15 +690,17 @@ namespace Hits {
             // order). LEAF_RANGE_WEIGHT = 0 removes these terms.
             const double range_o = std::log2(std::max(2.0, double(data_count)));
             const double range_h = double(prebuilt_hash->capacity);
-            const double cost_o = QUERY_WEIGHT * leaf_cost_weight * mu_o
+            // the query terms are now nanoseconds; the memory term is slots/key (negligible beside
+            // ns, kept for a future calibrated ns-per-slot weight)
+            const double cost_o = QUERY_WEIGHT * mu_o
                                   + leaf_range_weight * leaf_cost_weight * range_o
                                   + MEMORY_WEIGHT * mem_o;
-            const double cost_h = QUERY_WEIGHT * leaf_cost_weight * mu_h
+            const double cost_h = QUERY_WEIGHT * mu_h
                                   + leaf_range_weight * leaf_cost_weight * range_h
                                   + MEMORY_WEIGHT * mem_h;
             use_ordered = (cost_o < cost_h) && (data_count > DATA_NODE_SIZE);
             if (data_count > 1000) {
-                fprintf(stderr, "COSTDEBUG size=%d mu_o=%.3f mu_h=%.3f mem_o=%.3f mem_h=%.3f cost_o=%.3f cost_h=%.3f ordered=%d\n",
+                fprintf(stderr, "COSTDEBUG size=%d mu_o_ns=%.1f mu_h_ns=%.1f mem_o=%.3f mem_h=%.3f cost_o=%.1f cost_h=%.1f ordered=%d\n",
                         data_count, mu_o, mu_h, mem_o, mem_h, cost_o, cost_h, int(cost_o < cost_h));
             }
         } else if (leaf_window_threshold > 0) {
