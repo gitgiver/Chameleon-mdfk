@@ -679,7 +679,7 @@ namespace Hits {
                                   + leaf_range_weight * leaf_cost_weight * range_h
                                   + MEMORY_WEIGHT * mem_h;
             use_ordered = (cost_o < cost_h) && (data_count > DATA_NODE_SIZE);
-            if (data_count > 1000000) {
+            if (data_count > 1000) {
                 fprintf(stderr, "COSTDEBUG size=%d mu_o=%.3f mu_h=%.3f mem_o=%.3f mem_h=%.3f cost_o=%.3f cost_h=%.3f ordered=%d\n",
                         data_count, mu_o, mu_h, mem_o, mem_h, cost_o, cost_h, int(cost_o < cost_h));
             }

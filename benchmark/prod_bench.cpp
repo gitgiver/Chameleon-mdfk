@@ -360,11 +360,20 @@ int main() {
                 const double l_cold = cold_n ? double(cold_c) / ticks_per_ns / double(cold_n) : 0.0;
                 const double l_w = tot_n ? double(hot_c + cold_c) / ticks_per_ns / double(tot_n) : 0.0;
                 long long flipped = 0;
-                if (runtime_adaptive) { flipped = index->rebalance_leaves(); }
+                double reb_ms = 0.0;
+                if (runtime_adaptive) {
+                    // Time the rebalance itself (tree walk + re-hashing the flipped leaves). It sits
+                    // OUTSIDE the query timer above, so without this it is completely invisible.
+                    auto rb0 = std::chrono::high_resolution_clock::now();
+                    flipped = index->rebalance_leaves();
+                    auto rb1 = std::chrono::high_resolution_clock::now();
+                    reb_ms = std::chrono::duration<double, std::milli>(rb1 - rb0).count();
+                }
                 const double mem1 = index->memory_occupied() / denom;
-                printf("  seg %zu.%ld: point=%.1f nh=%ld nc=%ld l_hot=%.1f l_cold=%.1f L=%.1f "
+                printf("  seg %zu.%ld: point=%.1f reb_ms=%.1f nh=%ld nc=%ld l_hot=%.1f l_cold=%.1f L=%.1f "
                        "mem=%.4f->%.4f flipped=%lld err=%ld\n",
-                       p, q0 / segq, point_ns, hot_n, cold_n, l_hot, l_cold, l_w, mem0, mem1, flipped, perr);
+                       p, q0 / segq, point_ns, reb_ms, hot_n, cold_n, l_hot, l_cold, l_w,
+                       mem0, mem1, flipped, perr);
                 fflush(stdout);
             }
         }
